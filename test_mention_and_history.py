@@ -1,9 +1,13 @@
-"""Regression tests for the two on_message bugs that reached production:
+"""Regression tests for on_message behaviour.
+
+Covers the bugs that reached production plus the context feature:
 
 1. asyncpg's jsonb codec returns str, so get_history() handed a string to
    history.append() and on_message died with AttributeError -> the bot stopped
    answering "be yeu" at all.
 2. Triggering by @mention of the bot did not work.
+3. Plain chatter was invisible to the model, so tagging it mid-argument made it
+   ask for the context again.
 """
 import asyncio
 import json
@@ -35,10 +39,9 @@ turns = [
 check("decode: None -> []", bot_mod.decode_messages(None) == [])
 check("decode: already a list", bot_mod.decode_messages(turns) == turns)
 # This is the exact value asyncpg returns for a jsonb column by default.
-check("decode: jsonb text (the production crash)",
-      bot_mod.decode_messages(json.dumps(turns)) == turns,
-      f"type={type(bot_mod.decode_messages(json.dumps(turns))).__name__}")
-# A row written through json.dumps twice must still be recoverable.
+crash_value = bot_mod.decode_messages(json.dumps(turns))
+check("decode: jsonb text (the production crash)", crash_value == turns,
+      f"type={type(crash_value).__name__}")
 check("decode: double-encoded", bot_mod.decode_messages(json.dumps(json.dumps(turns))) == turns)
 check("decode: garbage str -> []", bot_mod.decode_messages("{not json") == [])
 check("decode: empty str -> []", bot_mod.decode_messages("") == [])
@@ -47,9 +50,7 @@ check("decode: dict -> []", bot_mod.decode_messages('{"role":"user"}') == [])
 check("decode: drops non-dict entries",
       bot_mod.decode_messages('[{"role":"user"}, "junk", 7]') == [{"role": "user"}])
 
-# The full round trip save_history -> get_history must yield a mutable list.
-blob = json.dumps(turns)
-decoded = bot_mod.decode_messages(blob)
+decoded = bot_mod.decode_messages(json.dumps(turns))
 decoded.append({"role": "user", "content": "third"})
 check("decode: result is appendable", len(decoded) == 3)
 check("decode: round trip preserves content", decoded[0] == turns[0])
@@ -79,10 +80,15 @@ text, mentioned = bot_mod.strip_mentions(
     f"<@{BOT_ID}> hoi <@{other.id}>", [bot_user, other], BOT_ID)
 check("mention: both handled", (text, mentioned) == ("hoi @Đạo", True), f"got={(text, mentioned)}")
 
+tmp_buf = bot_mod.pending[999999]
+check("pending buffer is capped", tmp_buf.maxlen == bot_mod.PENDING_MAX,
+      f"maxlen={tmp_buf.maxlen}")
+del bot_mod.pending[999999]
+
 
 # ---------- 3. on_message end to end (DB + webhook stubbed) ----------
 
-calls = {"webhook": [], "research": [], "persist": [], "saved": [], "replies": []}
+calls = {"webhook": [], "research": [], "saved": [], "replies": [], "ok": True}
 
 
 class FakeChannel:
@@ -100,9 +106,11 @@ class FakeChannel:
 
     async def send(self, text, **kw):
         calls["research"].append(text)
+
         class Sent:
             async def edit(self, content=None, file=None):
                 calls["research"].append(("edit", content))
+
         return Sent()
 
 
@@ -128,12 +136,15 @@ class Author:
 
 
 async def fake_get_history(cid):
-    # Simulate a stored row: asyncpg hands back the JSONB column as a str.
+    # Simulate a stored row: asyncpg hands the JSONB column back as a str.
     return bot_mod.decode_messages(json.dumps(calls.setdefault("stored", [])))
 
 
 async def fake_call_webhook(history, cid):
     calls["webhook"].append(list(history))
+    await asyncio.sleep(0.02)  # let a concurrent message interleave
+    if not calls["ok"]:
+        return False, {"error": "boom"}
     return True, {"answer": "Bé nghe đây ạ!"}
 
 
@@ -157,36 +168,66 @@ bot_mod.bot._connection.user = bot_user  # Client.user reads _connection.user
 human = Author("Minh")
 
 
-async def run(content, author=human, mentions=()):
-    calls["webhook"].clear()
-    calls["research"].clear()
-    calls["saved"].clear()
-    calls["stored"] = []
+async def run(content, author=human, mentions=(), reset=True, ok=True):
+    if reset:
+        calls["webhook"].clear()
+        calls["research"].clear()
+        calls["saved"].clear()
+        calls["replies"].clear()
+        calls["stored"] = []
+        bot_mod.pending.clear()
+    calls["ok"] = ok
     msg = FakeMessage(content, author, mentions)
     await bot_mod.on_message(msg)
     return msg
 
 
 async def main():
-    # keyword trigger still works
+    # keyword trigger
     await run("bé yêu hỏi t vài câu")
     check("kw: 'be yeu' triggers", len(calls["webhook"]) == 1)
     check("kw: sender prefixed",
           calls["webhook"] and calls["webhook"][0][-1]["content"].startswith("[Minh]: "),
-          str(calls["webhook"][0][-1]["content"][:40]) if calls["webhook"] else "")
+          calls["webhook"][0][-1]["content"][:40] if calls["webhook"] else "")
     check("kw: user + assistant turns both saved",
           bool(calls["saved"]) and [m["role"] for m in calls["saved"][0]] == ["user", "assistant"],
           str([m["role"] for m in calls["saved"][0]]) if calls["saved"] else "nothing saved")
 
-    # non-trigger
+    # plain chatter: buffered, never answered
+    await run("ai sai trong cau ay?")
+    check("chatter: not answered", len(calls["webhook"]) == 0)
+    check("chatter: buffered as context",
+          len(bot_mod.pending[FakeChannel.id]) == 1,
+          str(bot_mod.pending[FakeChannel.id]))
+
+    await run("t cho rang ban doi sai", reset=False)
+    check("chatter: accumulates", len(bot_mod.pending[FakeChannel.id]) == 2)
+
+    # the tag must carry everything that was said since the last answer
+    await run(f"<@{BOT_ID}> ai sai day", mentions=[bot_user], reset=False)
+    payload = calls["webhook"][0] if calls["webhook"] else []
+    check("tag: payload = 2 chatter + 1 question", len(payload) == 3,
+          str([m["content"][:30] for m in payload]))
+    check("tag: context comes first",
+          payload and payload[0]["content"].endswith("ai sai trong cau ay?"),
+          payload[0]["content"][:40] if payload else "")
+    check("tag: question is last",
+          payload and payload[-1]["content"].endswith("ai sai day"),
+          payload[-1]["content"][:40] if payload else "")
+    check("tag: context flushed after success", FakeChannel.id not in bot_mod.pending)
+    check("tag: whole transcript persisted",
+          bool(calls["saved"]) and [m["role"] for m in calls["saved"][0]]
+          == ["user", "user", "user", "assistant"],
+          str([m["role"] for m in calls["saved"][0]]) if calls["saved"] else "")
+
+    # non-trigger without any keyword
     await run("xin chao moi nguoi")
     check("plain message ignored", len(calls["webhook"]) == 0)
 
     # @mention triggers with no keyword
     await run(f"<@{BOT_ID}> cho t xin loi chuc", mentions=[bot_user])
     check("mention: triggers", len(calls["webhook"]) == 1)
-    check("mention: token removed",
-          calls["webhook"] and "<@" not in calls["webhook"][0][-1]["content"],
+    check("mention: token removed", "<@" not in calls["webhook"][0][-1]["content"],
           calls["webhook"][0][-1]["content"] if calls["webhook"] else "")
 
     # bare @mention -> model still gets a non-empty turn
@@ -208,24 +249,56 @@ async def main():
     await run(f"<@{other.id}> oi", mentions=[other])
     check("other mention ignored", len(calls["webhook"]) == 0)
 
-    # mention renders the other user as a name, not a raw ID
-    await run(f"<@{BOT_ID}> {other.id} la ai", mentions=[bot_user])
-    check("mention: chat still triggers", len(calls["webhook"]) == 1)
-
     # bot messages ignored
     await run("bé yêu", author=Author("bot", bot=True))
     check("bot author ignored", len(calls["webhook"]) == 0 and len(calls["research"]) == 0)
 
-    # empty content ignored
+    # blank content ignored
     await run("   ")
     check("blank ignored", len(calls["webhook"]) == 0)
 
-    # history round trip: what persist stored must be readable next turn
-    stored = json.dumps([{"role": "user", "content": "q"},
-                         {"role": "assistant", "content": "a"}])
-    reloaded = bot_mod.decode_messages(stored)
+    # a failed call must not swallow the buffered context
+    await run("chatter truoc loi", ok=True)
+    await run(f"<@{BOT_ID}> hoi sau loi", mentions=[bot_user], reset=False, ok=False)
+    check("failure: error reported", len(calls["replies"]) == 1 and "boom" in calls["replies"][0],
+          str(calls["replies"]))
+    check("failure: context kept for retry",
+          FakeChannel.id in bot_mod.pending and len(bot_mod.pending[FakeChannel.id]) == 1,
+          f"pending={len(bot_mod.pending.get(FakeChannel.id, []))}")
+    check("failure: nothing persisted", len(calls["saved"]) == 0)
+
+    # retry after the failure must still carry the buffered context
+    await run(f"<@{BOT_ID}> hoi lai", mentions=[bot_user], reset=False, ok=True)
+    retry = calls["webhook"][-1] if calls["webhook"] else []
+    check("retry: carries the kept context", len(retry) == 2,
+          str([m["content"][:30] for m in retry]))
+
+    # two tags at once: the per-channel lock must not lose either turn
+    calls["webhook"].clear()
+    calls["saved"].clear()
+    calls["stored"] = []
+    bot_mod.pending.clear()
+    calls["ok"] = True
+    msgs = [FakeMessage(f"<@{BOT_ID}> cau {i}", human, [bot_user]) for i in range(2)]
+    await asyncio.gather(*(bot_mod.on_message(m) for m in msgs))
+    final = calls["saved"][-1] if calls["saved"] else []
+    contents = [m["content"] for m in final]
+    check("concurrent: both questions stored",
+          any("cau 0" in c for c in contents) and any("cau 1" in c for c in contents),
+          str(contents))
+    check("concurrent: answers not overwritten",
+          [m["role"] for m in final].count("assistant") == 2,
+          str([m["role"] for m in final]))
+    check("concurrent: order kept",
+          contents.index(next(c for c in contents if "cau 0" in c))
+          < contents.index(next(c for c in contents if "cau 1" in c)))
+
+    # history survives a second turn
+    reloaded = bot_mod.decode_messages(json.dumps(
+        [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]))
     reloaded.append({"role": "user", "content": "next"})
-    check("history: survives a second turn", len(reloaded) == 3, str([m["role"] for m in reloaded]))
+    check("history: survives a second turn", len(reloaded) == 3,
+          str([m["role"] for m in reloaded]))
 
 
 asyncio.run(main())

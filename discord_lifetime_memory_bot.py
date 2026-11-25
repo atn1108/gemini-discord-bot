@@ -6,6 +6,8 @@ import asyncpg
 import json
 import io
 import re
+import asyncio
+from collections import defaultdict, deque
 from typing import List, Dict, Optional
 import time
 
@@ -19,6 +21,9 @@ MAX_HISTORY = int(os.getenv("MAX_HISTORY", "50"))
 # Cap a single stored turn so a long answer cannot blow up the JSONB row
 # or the context window we resend on every call.
 STORE_MAX = int(os.getenv("STORE_MAX", "4000"))
+# Plain chatter kept between answered turns, so tagging the bot mid-argument
+# lets it see the conversation instead of asking for context again.
+PENDING_MAX = int(os.getenv("PENDING_MAX", "40"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "Gemini Bot")
 BOT_AVATAR = os.getenv("BOT_AVATAR", "")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -59,6 +64,14 @@ SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 
 # ===== DATABASE =====
 pool: asyncpg.Pool = None
+
+# Chatter seen since the last answered turn: kept in memory and merged into the
+# next prompt, so tagging the bot mid-conversation carries the surrounding
+# context instead of making everyone re-explain it.
+pending: Dict[int, deque] = defaultdict(lambda: deque(maxlen=PENDING_MAX))
+# Serialises answered turns per channel: two people tagging at once must not
+# read the same history and overwrite each other's stored answer.
+channel_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 async def init_db():
     global pool
@@ -299,35 +312,44 @@ async def on_message(message):
     if not content and mentioned:
         content = "alo"
 
-    logger.info(f"msg from {message.author.display_name} (mention={mentioned}): {content[:80]!r}")
-
     # Deep Research — "nghiên cứu X", "research X", "bot nghiên cứu X"
     topic = research_query(content)
     if topic:
+        logger.info(f"research from {message.author.display_name}: {topic!r}")
         await deliver_research(message.channel.send, topic)
         return
 
-    if not mentioned:
-        content_lower = content.lower()
-        if not any(kw in content_lower for kw in KEYWORDS):
-            return
-    
     # Prefix the sender so the model knows who is talking (see system prompt persona)
-    tagged = f"[{message.author.display_name}]: {content}"
+    turn = {"role": "user", "content": f"[{message.author.display_name}]: {content}"[:STORE_MAX]}
 
-    history = await get_history(message.channel.id)
-    history.append({"role": "user", "content": tagged})
-    
-    async with message.channel.typing():
-        success, result = await call_webhook(history, message.channel.id)
-    
+    if not mentioned and not any(kw in content.lower() for kw in KEYWORDS):
+        # Plain chatter: keep it as context for the next tag, do not answer.
+        pending[message.channel.id].append(turn)
+        logger.info(f"ctx #{message.channel.id} from {message.author.display_name} "
+                    f"({len(pending[message.channel.id])} buffered): {content[:60]!r}")
+        return
+
+    logger.info(f"ask from {message.author.display_name} (mention={mentioned}): {content[:80]!r}")
+    channel_id = message.channel.id
+    async with channel_locks[channel_id]:
+        # Stored transcript + chatter since the last answer + this message, so
+        # the model already knows what the group was talking about.
+        history = await get_history(channel_id)
+        messages = history + list(pending.get(channel_id, ())) + [turn]
+
+        async with message.channel.typing():
+            success, result = await call_webhook(messages, channel_id)
+
+        if success:
+            # The buffered chatter is stored now, so it stops being pending.
+            pending.pop(channel_id, None)
+            await persist_turn(channel_id, messages, result.get("answer", ""))
+        else:
+            # Nothing was stored: keep the buffer so the context is not lost.
+            await message.reply(f"❌ Error: {result.get('error', 'Unknown error')}")
+
     if success:
-        await persist_turn(message.channel.id, history, result.get("answer", ""))
         await message.add_reaction("✅")
-    else:
-        await message.reply(f"❌ Error: {result.get('error', 'Unknown error')}")
-        history.pop()
-        await save_history(message.channel.id, history)
 
 # ===== COMMANDS =====
 @bot.slash_command(name="forget", description="Clear conversation memory in this channel")

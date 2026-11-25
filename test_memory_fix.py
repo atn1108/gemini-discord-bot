@@ -79,10 +79,12 @@ check("empty answer still saves user turn", saved.get(333) == [{"role": "user", 
 
 # 2d. on_message / ask must actually call persist_turn on success
 bot_src = open(os.path.join(os.path.dirname(__file__), "discord_lifetime_memory_bot.py"), encoding="utf-8").read()
-check("on_message calls persist_turn", "await persist_turn(message.channel.id, history," in bot_src)
+check("on_message calls persist_turn", "await persist_turn(channel_id, messages," in bot_src)
 check("ask calls persist_turn", "await persist_turn(ctx.channel.id, history," in bot_src)
+# save_history now runs only from persist_turn and /ask's error path: a failed
+# call stores nothing, because there is nothing to undo.
 check("no bare save on success path",
-      bot_src.count("await save_history(") == 3,  # persist_turn + 2 error paths
+      bot_src.count("await save_history(") == 2,
       f"count={bot_src.count('await save_history(')}")
 
 # 2e. history round-trips through JSON (what actually lands in Postgres JSONB)
