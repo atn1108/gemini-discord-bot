@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://gemini-discord-forwarder-production.up.railway.app/webhook/gemini-to-discord")
 KEYWORDS = [k.strip().lower() for k in os.getenv("TRIGGER_KEYWORDS", "gemini,ai,ask,hey bot").split(",")]
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "50"))
+# Cap a single stored turn so a long answer cannot blow up the JSONB row
+# or the context window we resend on every call.
+STORE_MAX = int(os.getenv("STORE_MAX", "4000"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "Gemini Bot")
 BOT_AVATAR = os.getenv("BOT_AVATAR", "")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -95,6 +98,17 @@ async def save_history(channel_id: int, messages: List[Dict]):
 async def clear_history(channel_id: int):
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM conversations WHERE channel_id = $1", channel_id)
+
+async def persist_turn(channel_id: int, history: List[Dict], answer: str) -> None:
+    """Append the assistant reply and save, so the exchange actually persists.
+
+    Without this the DB only ever held user turns (and only on errors), which
+    made conversation memory silently stop growing.
+    """
+    answer = (answer or "").strip()
+    if answer:
+        history.append({"role": "assistant", "content": answer[:STORE_MAX]})
+    await save_history(channel_id, history)
 
 # ===== DEEP RESEARCH =====
 def chunk_text(text: str, limit: int = 1900) -> List[str]:
@@ -271,6 +285,7 @@ async def on_message(message):
         success, result = await call_webhook(history, message.channel.id)
     
     if success:
+        await persist_turn(message.channel.id, history, result.get("answer", ""))
         await message.add_reaction("✅")
     else:
         await message.reply(f"❌ Error: {result.get('error', 'Unknown error')}")
@@ -306,6 +321,7 @@ async def ask(ctx, question: str):
     
     success, result = await call_webhook(history, ctx.channel.id)
     if success:
+        await persist_turn(ctx.channel.id, history, result.get("answer", ""))
         await ctx.followup.send("✅ Sent! Response will appear shortly.")
     else:
         await ctx.followup.send(f"❌ Error: {result.get('error', 'Unknown error')}")
