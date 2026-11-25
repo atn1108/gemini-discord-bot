@@ -4,7 +4,7 @@ import logging
 import os
 
 # Match Railway production config before the module reads its env.
-os.environ["TRIGGER_KEYWORDS"] = "con vợ siêu múp, bot, ê gemini, ai"
+os.environ["TRIGGER_KEYWORDS"] = "bé yêu"
 
 logging.disable(logging.DEBUG)
 
@@ -29,8 +29,7 @@ check("/research registered", "research" in cmds)
 check("/ask registered", "ask" in cmds)
 check("/forget registered", "forget" in cmds)
 check("/memory registered", "memory" in cmds)
-check("KEYWORDS from env", bot_mod.KEYWORDS == ["con vợ siêu múp", "bot", "ê gemini", "ai"],
-      str(bot_mod.KEYWORDS))
+check("KEYWORDS from env", bot_mod.KEYWORDS == ["bé yêu"], str(bot_mod.KEYWORDS))
 
 # 2. System prompt wired in
 check("SYSTEM_PROMPT non-empty", len(bot_mod.SYSTEM_PROMPT) > 200, f"{len(bot_mod.SYSTEM_PROMPT)} chars")
@@ -42,22 +41,22 @@ cases = [
     ("research quantum computing", "quantum computing"),
     ("deep research pin lithium", "pin lithium"),
     ("nghien cuu gia vang hom nay", "gia vang hom nay"),
-    ("bot nghiên cứu đối thủ tiktok", "đối thủ tiktok"),   # leading keyword stripped
-    ("ê gemini research rust vs go", "rust vs go"),
+    ("bé yêu nghiên cứu đối thủ tiktok", "đối thủ tiktok"),   # leading keyword stripped
+    ("bé yêu research rust vs go", "rust vs go"),
 ]
 for raw, want in cases:
     got = bot_mod.research_query(raw)
     check(f"research_query({raw!r})", got == want, f"got={got!r} want={want!r}")
 
-# Multiple leading keywords must all be peeled off
+# Keyword stripping must not loop forever or eat the topic
 multi = [
-    ("bot ê gemini research rust vs go", "rust vs go"),
-    ("con vợ siêu múp nghiên cứu pin lithium", "pin lithium"),
-    ("ai research tokamak", "tokamak"),
+    ("bé yêu deep research tokamak", "tokamak"),
+    ("BÉ YÊU NGHIÊN CỨU pin lithium", "pin lithium"),
+    ("bé yêu   research   spaced topic  ", "spaced topic"),
 ]
 for raw, want in multi:
     got = bot_mod.research_query(raw)
-    check(f"multi-keyword({raw!r})", got == want, f"got={got!r} want={want!r}")
+    check(f"stripping({raw!r})", got == want, f"got={got!r} want={want!r}")
 
 # Must NOT trigger normal chat
 for raw in ("xin chào", "bot hỏi đáp đi", "nghiên cứu", "ai là ai"):

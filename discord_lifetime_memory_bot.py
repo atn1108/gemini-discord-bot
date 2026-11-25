@@ -131,10 +131,15 @@ def research_query(content: str) -> Optional[str]:
                 break
         else:
             break  # no keyword matched on this pass -> done
-    lowered = text.lower()
-    for prefix in RESEARCH_PREFIXES:
-        if lowered.startswith(prefix):
-            return text[len(prefix):].strip() or None
+    # Match the prefix case-insensitively and slice at the match end, so the
+    # slice offset always lines up with `text` (lowercasing can change lengths).
+    m = re.match(
+        "|".join(re.escape(p) for p in RESEARCH_PREFIXES),
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return text[m.end():].strip() or None
     return None
 
 async def run_deep_research(query: str, max_sources: int = RESEARCH_DEFAULT_SOURCES) -> Dict:
