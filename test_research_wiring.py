@@ -92,10 +92,11 @@ check("format completed -> md full length", len(md) > len(text), f"md={len(md)} 
 fail_text, fail_md = bot_mod.format_research({"status": "failed", "error": "quota exceeded"}, "x")
 check("format failed -> error msg", "quota exceeded" in fail_text and fail_md == "")
 
-# 7. Webhook payload carries the system prompt
+# 7. Webhook payload carries the system prompt (persona + remembered facts)
 import inspect
 src = inspect.getsource(bot_mod.call_webhook)
-check("call_webhook sends system", '"system": SYSTEM_PROMPT' in src)
+check("call_webhook sends system", '"system": await build_system_prompt()' in src)
+check("call_webhook builds prompt", "build_system_prompt" in src)
 
 # 8. Timeout guards
 check("RESEARCH_TIMEOUT bounded", 0 < bot_mod.RESEARCH_TIMEOUT <= 900, f"{bot_mod.RESEARCH_TIMEOUT}s")

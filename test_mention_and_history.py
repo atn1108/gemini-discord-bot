@@ -86,9 +86,75 @@ check("pending buffer is capped", tmp_buf.maxlen == bot_mod.PENDING_MAX,
 del bot_mod.pending[999999]
 
 
+# ---------- 3. remember / forget parsers ----------
+
+R = bot_mod.remember_query
+F = bot_mod.forget_query
+
+check("remember: 'nhớ t là Đạo'", R("nhớ t là Đạo") == "t là Đạo")
+check("remember: with keyword prefix", R("bé yêu nhớ t là Đạo") == "t là Đạo")
+check("remember: 'nhớ rằng ...'", R("nhớ rằng Max thích phở") == "Max thích phở")
+check("remember: 'nhớ là ...' before bare 'nhớ '",
+      R("nhớ là Đạo là anh cả") == "Đạo là anh cả")
+check("remember: english", R("remember that Max likes pho") == "Max likes pho")
+check("remember: 'nhớ giúp ...'", R("nhớ giúp t tên con mèo") == "t tên con mèo")
+check("remember: one word is not a fact", R("nhớ rồi") is None)
+check("remember: bare 'nhớ'", R("nhớ") is None)
+check("remember: unrelated text", R("xin chào") is None)
+check("remember: no keyword and not mentioned stays inert",
+      R("nhớ mua đồ") == "mua đồ")  # gated later by the trigger, not by the parser
+
+check("forget: 'quên X'", F("quên tên Đạo") == "tên Đạo")
+check("forget: with keyword prefix", F("bé yêu quên tên Đạo") == "tên Đạo")
+check("forget: english", F("forget Max") == "Max")
+check("forget: 'quên hết' -> wipe", F("quên hết") == "")
+check("forget: 'forget all' -> wipe", F("forget all") == "")
+check("forget: bare 'quên' is NOT a wipe", F("quên") is None)
+check("forget: unrelated text", F("cảm ơn") is None)
+
+check("research still parses after refactor", bot_mod.research_query("nghiên cứu pin") == "pin")
+check("research: keyword stripped first",
+      bot_mod.research_query("bé yêu research rust vs go") == "rust vs go")
+check("research: none", bot_mod.research_query("xin chào") is None)
+
+
+# ---------- 4. build_system_prompt ----------
+
+async def check_prompt():
+    bot_mod.SYSTEM_PROMPT = "PERSONA"
+    bot_mod.get_facts = _empty
+    p = await bot_mod.build_system_prompt()
+    check("prompt: no facts -> persona only", p == "PERSONA", p[:60])
+
+    async def with_facts():
+        return [{"fact": "tên anh là Đạo", "author": "Minh"},
+                {"fact": "Max thích phở", "author": ""}]
+
+    bot_mod.get_facts = with_facts
+    p = await bot_mod.build_system_prompt()
+    check("prompt: persona kept", p.startswith("PERSONA"))
+    check("prompt: facts section added", "# Facts the group asked you to remember" in p)
+    check("prompt: fact text present", "tên anh là Đạo" in p and "Max thích phở" in p)
+    check("prompt: author attributed", "(do Minh nhờ nhớ)" in p)
+    check("prompt: no invented author", "(do  nhờ nhớ)" not in p)
+    # order preserved (oldest first as get_facts returns them)
+    check("prompt: fact order kept", p.index("tên anh") < p.index("Max thích"))
+    bot_mod.get_facts = fake_get_facts
+    bot_mod.SYSTEM_PROMPT = real_prompt
+
+
+async def _empty():
+    return []
+
+
+real_prompt = bot_mod.SYSTEM_PROMPT
+
+
 # ---------- 3. on_message end to end (DB + webhook stubbed) ----------
 
-calls = {"webhook": [], "research": [], "saved": [], "replies": [], "ok": True}
+calls = {"webhook": [], "research": [], "saved": [], "replies": [],
+         "facts_added": [], "facts_deleted": [], "fact_list": [], "fact_rows": 0,
+         "ok": True}
 
 
 class FakeChannel:
@@ -157,12 +223,28 @@ async def fake_research(send, topic, **kw):
     calls["research"].append(topic)
 
 
+async def fake_add_fact(fact, author):
+    calls["facts_added"].append((fact, author))
+
+
+async def fake_delete_facts(pattern):
+    calls["facts_deleted"].append(pattern)
+    return calls.get("fact_rows", 0)
+
+
+async def fake_get_facts():
+    return list(calls.get("fact_list", []))
+
+
 bot_mod.get_history = fake_get_history
 bot_mod.call_webhook = fake_call_webhook
 # persist_turn is NOT stubbed: the real one must append the assistant turn and
 # hand both sides to save_history, which is the production fix under test.
 bot_mod.save_history = fake_save
 bot_mod.deliver_research = fake_research
+bot_mod.add_fact = fake_add_fact
+bot_mod.delete_facts = fake_delete_facts
+bot_mod.get_facts = fake_get_facts
 bot_mod.bot._connection.user = bot_user  # Client.user reads _connection.user
 
 human = Author("Minh")
@@ -174,6 +256,8 @@ async def run(content, author=human, mentions=(), reset=True, ok=True):
         calls["research"].clear()
         calls["saved"].clear()
         calls["replies"].clear()
+        calls["facts_added"].clear()
+        calls["facts_deleted"].clear()
         calls["stored"] = []
         bot_mod.pending.clear()
     calls["ok"] = ok
@@ -183,6 +267,8 @@ async def run(content, author=human, mentions=(), reset=True, ok=True):
 
 
 async def main():
+    await check_prompt()
+
     # keyword trigger
     await run("bé yêu hỏi t vài câu")
     check("kw: 'be yeu' triggers", len(calls["webhook"]) == 1)
@@ -256,6 +342,50 @@ async def main():
     # blank content ignored
     await run("   ")
     check("blank ignored", len(calls["webhook"]) == 0)
+
+    # remember: stores the fact, replies, and does not ask the model
+    await run("bé yêu nhớ t là Đạo")
+    check("remember: fact stored",
+          calls["facts_added"] == [("t là Đạo", "Minh")], str(calls["facts_added"]))
+    check("remember: confirms in chat",
+          len(calls["replies"]) == 1 and "Đã nhớ" in calls["replies"][0]
+          and "t là Đạo" in calls["replies"][0], str(calls["replies"]))
+    check("remember: no model call", not calls["webhook"] and not calls["saved"])
+
+    # remember via @mention, no keyword
+    await run(f"<@{BOT_ID}> remember that Max likes pho", mentions=[bot_user])
+    check("remember: mention trigger",
+          calls["facts_added"] == [("Max likes pho", "Minh")], str(calls["facts_added"]))
+
+    # a plain chat message must never store a fact, even starting with "nhớ"
+    await run("nhớ mua đồ mai")
+    check("remember: ungated message ignored",
+          not calls["facts_added"] and not calls["webhook"],
+          str(calls["facts_added"]))
+
+    # forget: deletes matching facts
+    calls["fact_rows"] = 1
+    await run("bé yêu quên Đạo")
+    check("forget: pattern sent", calls["facts_deleted"] == ["Đạo"],
+          str(calls["facts_deleted"]))
+    check("forget: reports count",
+          calls["replies"] and "1" in calls["replies"][-1], str(calls["replies"]))
+    check("forget: no model call", not calls["webhook"])
+
+    # forget everything
+    calls["fact_rows"] = 3
+    await run("bé yêu quên hết")
+    check("forget all: empty pattern", calls["facts_deleted"] == [""],
+          str(calls["facts_deleted"]))
+    check("forget all: reports total", "3" in calls["replies"][-1],
+          calls["replies"][-1] if calls["replies"] else "")
+
+    # bare "quên" is chat, not a wipe
+    await run("bé yêu quên")
+    check("forget: bare word does not wipe",
+          not calls["facts_deleted"] and calls["webhook"],
+          f"deleted={calls['facts_deleted']} webhook={len(calls['webhook'])}")
+    calls["fact_rows"] = 0
 
     # a failed call must not swallow the buffered context
     await run("chatter truoc loi", ok=True)

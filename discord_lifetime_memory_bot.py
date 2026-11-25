@@ -39,6 +39,10 @@ RESEARCH_DEFAULT_SOURCES = int(os.getenv("RESEARCH_DEFAULT_SOURCES", "10"))
 # A message counts as a research request when it starts with one of these
 # (optionally after a trigger keyword, e.g. "bot nghiên cứu thị trường crypto").
 RESEARCH_PREFIXES = ("deep research ", "deepresearch ", "nghiên cứu ", "nghien cuu ", "research ")
+# Longest first — see _match_prefix.
+REMEMBER_PREFIXES = ("remember that ", "remember to ", "remember:",
+                     "nhớ rằng ", "nhớ là ", "nhớ giúp ", "nhớ cho ", "nhớ ")
+FORGET_PREFIXES = ("forget ", "quên ")
 
 # ===== SYSTEM PROMPT ("Bé Yêu") =====
 # Override with the SYSTEM_PROMPT env var if you want to change persona without a redeploy.
@@ -88,6 +92,17 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_conversations_updated 
             ON conversations(updated_at DESC);
         """)
+        # Facts the group explicitly asked the bot to remember (names, nicknames).
+        # Global on purpose: a name is valid in every channel, and /forget only
+        # clears conversation history.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS facts (
+                id SERIAL PRIMARY KEY,
+                fact TEXT NOT NULL,
+                author TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
     logger.info("Database initialized")
 
 def decode_messages(raw) -> List[Dict]:
@@ -130,6 +145,57 @@ async def clear_history(channel_id: int):
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM conversations WHERE channel_id = $1", channel_id)
 
+# ===== REMEMBERED FACTS =====
+FACT_MAX = 500        # one fact, capped so a pasted wall of text cannot bloat the prompt
+FACT_LIMIT = 50       # how many facts ride along with every request
+
+async def add_fact(fact: str, author: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO facts (fact, author) VALUES ($1, $2)",
+            fact[:FACT_MAX], author[:100],
+        )
+
+async def get_facts() -> List[Dict]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT fact, author FROM facts ORDER BY created_at DESC LIMIT $1",
+            FACT_LIMIT,
+        )
+    # Oldest first, so the prompt reads in the order things were said.
+    return [{"fact": r["fact"], "author": r["author"]} for r in reversed(rows)]
+
+async def delete_facts(pattern: str) -> int:
+    """Delete facts containing `pattern`; an empty pattern deletes every fact.
+
+    Returns how many rows went away.
+    """
+    async with pool.acquire() as conn:
+        if pattern:
+            status = await conn.execute(
+                "DELETE FROM facts WHERE fact ILIKE $1", f"%{pattern}%")
+        else:
+            status = await conn.execute("DELETE FROM facts")
+    # asyncpg returns e.g. "DELETE 3".
+    parts = status.split()
+    return int(parts[-1]) if len(parts) == 2 and parts[-1].isdigit() else 0
+
+async def build_system_prompt() -> str:
+    """The persona prompt, with the remembered facts appended when there are any."""
+    facts = await get_facts()
+    if not facts:
+        return SYSTEM_PROMPT
+    lines = "\n".join(
+        f"- {f['fact']} (do {f['author']} nhờ nhớ)" if f["author"] else f"- {f['fact']}"
+        for f in facts
+    )
+    return (
+        SYSTEM_PROMPT
+        + "\n\n# Facts the group asked you to remember\n"
+        + "Use them when relevant; do not invent any others.\n"
+        + lines
+    )
+
 async def persist_turn(channel_id: int, history: List[Dict], answer: str) -> None:
     """Append the assistant reply and save, so the exchange actually persists.
 
@@ -160,14 +226,9 @@ def chunk_text(text: str, limit: int = 1900) -> List[str]:
         rest = rest[cut:].lstrip("\n")
     return chunks
 
-def research_query(content: str) -> Optional[str]:
-    """Return the research topic if this message is a research request, else None.
-
-    Accepts "nghiên cứu X", "research X", and messages with trigger keywords
-    stripped first, e.g. "bot nghiên cứu X" or "ê gemini research X".
-    """
-    text = content.strip()
-    # Peel off any leading trigger keywords ("bot ", "ê gemini ", ...)
+def strip_keywords(text: str) -> str:
+    """Peel off leading trigger keywords ("bé yêu ", "bot ", ...) until none match."""
+    text = text.strip()
     while True:
         for kw in KEYWORDS:
             m = re.match(re.escape(kw) + r"\s+", text, flags=re.IGNORECASE)
@@ -176,16 +237,55 @@ def research_query(content: str) -> Optional[str]:
                 break
         else:
             break  # no keyword matched on this pass -> done
-    # Match the prefix case-insensitively and slice at the match end, so the
-    # slice offset always lines up with `text` (lowercasing can change lengths).
+    return text
+
+def _match_prefix(text: str, prefixes: tuple) -> Optional[str]:
+    """Return what follows the first matching prefix, or None if none matches.
+
+    Longest prefix first: re's alternation prefers the leftmost alternative, so
+    "nhớ rằng " has to be tried before "nhớ " or the filler word leaks into the
+    captured text. Slicing at the match end keeps the offset aligned with
+    `text` even when casefolding changes lengths.
+    """
     m = re.match(
-        "|".join(re.escape(p) for p in RESEARCH_PREFIXES),
+        "|".join(re.escape(p) for p in prefixes),
         text,
         flags=re.IGNORECASE,
     )
-    if m:
-        return text[m.end():].strip() or None
-    return None
+    return text[m.end():].strip() if m else None
+
+def research_query(content: str) -> Optional[str]:
+    """Return the research topic if this message is a research request, else None.
+
+    Accepts "nghiên cứu X", "research X", and messages with trigger keywords
+    stripped first, e.g. "bot nghiên cứu X" or "ê gemini research X".
+    """
+    return _match_prefix(strip_keywords(content), RESEARCH_PREFIXES) or None
+
+def remember_query(content: str) -> Optional[str]:
+    """Return the fact to store when someone asks the bot to remember, else None.
+
+    "bé yêu nhớ t là Đạo" / "@bot remember that Max likes pho" both work. A
+    one-word capture ("nhớ rồi") is not a fact, so it falls through to chat.
+    """
+    fact = _match_prefix(strip_keywords(content), REMEMBER_PREFIXES)
+    if not fact or len(fact.split()) < 2:
+        return None
+    return fact
+
+def forget_query(content: str) -> Optional[str]:
+    """Return the delete pattern, "" for "forget everything", or None if this
+    message is not a forget request.
+
+    None vs "" matters: an empty capture ("quên" with nothing after it) must
+    not wipe every fact, so it stays None and the message is treated as chat.
+    """
+    pattern = _match_prefix(strip_keywords(content), FORGET_PREFIXES)
+    if pattern is None:
+        return None
+    if pattern.lower() in ("hết", "all", "het", "xóa hết", "xoa het"):
+        return ""
+    return pattern or None
 
 async def run_deep_research(query: str, max_sources: int = RESEARCH_DEFAULT_SOURCES) -> Dict:
     """Call the Railway deep-research endpoint. Synchronous, bounded by RESEARCH_TIMEOUT."""
@@ -269,7 +369,7 @@ bot = discord.Bot(intents=intents)
 async def call_webhook(history: List[Dict], channel_id: int) -> tuple[bool, dict]:
     payload = {
         "messages": history,
-        "system": SYSTEM_PROMPT,
+        "system": await build_system_prompt(),
         "username": BOT_USERNAME,
         "avatar_url": BOT_AVATAR
     }
@@ -329,6 +429,25 @@ async def on_message(message):
                     f"({len(pending[message.channel.id])} buffered): {content[:60]!r}")
         return
 
+    # Remember / forget — gated on the trigger so a random "quên ... " in chat
+    # never deletes stored facts.
+    fact = remember_query(content)
+    if fact is not None:
+        await add_fact(fact, message.author.display_name)
+        logger.info(f"remember from {message.author.display_name}: {fact!r}")
+        await message.reply(f"🧠 Đã nhớ: **{fact}**")
+        return
+
+    pattern = forget_query(content)
+    if pattern is not None:
+        deleted = await delete_facts(pattern)
+        logger.info(f"forget from {message.author.display_name}: {pattern!r} -> {deleted}")
+        if pattern == "":
+            await message.reply(f"🗑️ Đã quên hết {deleted} điều.")
+        else:
+            await message.reply(f"🗑️ Đã quên {deleted} điều khớp **{pattern}**.")
+        return
+
     logger.info(f"ask from {message.author.display_name} (mention={mentioned}): {content[:80]!r}")
     channel_id = message.channel.id
     async with channel_locks[channel_id]:
@@ -355,7 +474,22 @@ async def on_message(message):
 @bot.slash_command(name="forget", description="Clear conversation memory in this channel")
 async def forget(ctx):
     await clear_history(ctx.channel.id)
-    await ctx.respond("🧠 Memory cleared for this channel (permanent).")
+    await ctx.respond("🧠 Conversation memory cleared for this channel (permanent).\n"
+                      "Facts I remember: `/facts`. To forget them: `quên hết`.")
+
+@bot.slash_command(name="facts", description="List facts the group asked me to remember")
+async def facts(ctx):
+    rows = await get_facts()
+    if not rows:
+        await ctx.respond("🧠 Nothing remembered yet. Try `nhớ t là Đạo`.")
+        return
+    lines = [f"{i}. {f['fact']}" + (f" — *{f['author']}*" if f["author"] else "")
+             for i, f in enumerate(rows, 1)]
+    # Discord caps a message at 2000 chars; facts are global so keep the list intact-ish.
+    out = "**Facts I remember:**\n" + "\n".join(lines)
+    if len(out) > 1900:
+        out = out[:1900] + "\n… (dùng `quên <từ>` để xóa)"
+    await ctx.respond(out)
 
 @bot.slash_command(name="memory", description="Show conversation history")
 async def memory(ctx):
