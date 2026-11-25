@@ -77,12 +77,30 @@ async def init_db():
         """)
     logger.info("Database initialized")
 
+def decode_messages(raw) -> List[Dict]:
+    """Parse the JSONB column into a list of turns.
+
+    asyncpg's default json/jsonb codec decodes to str, not to a parsed object,
+    so a stored row arrives as text (and a double-encoded row as text twice).
+    Tolerate every shape instead of blowing up on history.append.
+    """
+    for _ in range(2):
+        if not isinstance(raw, str):
+            break
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(raw, list):
+        return []
+    return [m for m in raw if isinstance(m, dict) and "role" in m]
+
 async def get_history(channel_id: int) -> List[Dict]:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT messages FROM conversations WHERE channel_id = $1", channel_id
         )
-        return row["messages"] if row else []
+        return decode_messages(row["messages"]) if row else []
 
 async def save_history(channel_id: int, messages: List[Dict]):
     trimmed = messages[-(MAX_HISTORY * 2):]
@@ -256,24 +274,43 @@ async def on_ready():
     logger.info(f"Keywords: {KEYWORDS}")
     logger.info(f"Max history: {MAX_HISTORY} exchanges (persistent)")
 
+def strip_mentions(text: str, mentioned_users, bot_id) -> tuple[str, bool]:
+    """Drop the bot's own mention token and render every other one as @name.
+
+    Returns (text, mentioned); mentioned means the bot itself was tagged, and
+    tagging the bot counts as a trigger even without a keyword.
+    """
+    mentioned = any(u.id == bot_id for u in mentioned_users)
+    for user in mentioned_users:
+        replacement = "" if user.id == bot_id else f"@{user.display_name}"
+        text = text.replace(f"<@{user.id}>", replacement).replace(f"<@!{user.id}>", replacement)
+    return text.strip(), mentioned
+
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
     
-    content = message.content.strip()
+    content = (message.content or "").strip()
     if not content:
         return
-    
+
+    content, mentioned = strip_mentions(content, message.mentions, bot.user.id if bot.user else 0)
+    if not content and mentioned:
+        content = "alo"
+
+    logger.info(f"msg from {message.author.display_name} (mention={mentioned}): {content[:80]!r}")
+
     # Deep Research — "nghiên cứu X", "research X", "bot nghiên cứu X"
     topic = research_query(content)
     if topic:
         await deliver_research(message.channel.send, topic)
         return
 
-    content_lower = content.lower()
-    if not any(kw in content_lower for kw in KEYWORDS):
-        return
+    if not mentioned:
+        content_lower = content.lower()
+        if not any(kw in content_lower for kw in KEYWORDS):
+            return
     
     # Prefix the sender so the model knows who is talking (see system prompt persona)
     tagged = f"[{message.author.display_name}]: {content}"
