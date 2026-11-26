@@ -908,7 +908,7 @@ async def image_gen_checks():
         return None
 
     async def no_poly(_client, _prompt, _ar=""):
-        return None
+        return None, "HTTP 503"
 
     real_dl = bot_mod._download_image_bytes
     real_poly = bot_mod._generate_via_pollinations
