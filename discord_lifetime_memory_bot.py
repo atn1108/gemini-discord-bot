@@ -849,7 +849,8 @@ async def _seed_peer_bots() -> None:
     me = bot.user.id if bot.user else 0
     for guild in bot.guilds:
         try:
-            members = await bot.http.get_members(guild.id, limit=1000)
+            members = await bot.http.get_members(guild.id, limit=1000,
+                                                 after=None)
         except Exception as e:
             logger.warning(f"peer bot seed failed for {guild.id}: {e}")
             continue
