@@ -18,6 +18,11 @@ from collections import defaultdict, deque
 from typing import List, Dict, Optional, Any
 import time
 
+try:  # optional dependency-free enough module that lives next to this file
+    from gemini_wm import remove_watermark as _gemini_wm_remove
+except Exception:  # pragma: no cover - bot must still boot without it
+    _gemini_wm_remove = None
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -60,6 +65,14 @@ IMAGE_GEN_TIMEOUT = int(os.getenv("IMAGE_GEN_TIMEOUT", "120"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image").strip()
 GEMINI_COOKIES = os.getenv("GEMINI_COOKIES", "")
+# Strip the visible Gemini "sparkle" watermark from generated images before they
+# are uploaded to Discord (server-side alpha unblend, no browser needed).
+REMOVE_GEMINI_WATERMARK = os.getenv("REMOVE_GEMINI_WATERMARK", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
+try:
+    WM_MIN_CONFIDENCE = float(os.getenv("WM_MIN_CONFIDENCE", "0.32"))
+except ValueError:
+    WM_MIN_CONFIDENCE = 0.32
 SKILLS_DIR = os.getenv("SKILLS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills"))
 MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(5 * 1024 * 1024)))
 MAX_FILE_TEXT_CHARS = int(os.getenv("MAX_FILE_TEXT_CHARS", "12000"))
@@ -1200,6 +1213,31 @@ async def _fetch_url(url: str) -> str:
 
 
 # ===== BUILT-IN IMAGE GENERATION & AUTO-FETCH =====
+
+def _strip_gemini_watermark(raw: bytes) -> bytes:
+    """Remove the Gemini sparkle watermark from image bytes before upload.
+
+    Same maths as the browser extensions: the watermark was composited as
+    px = src*(1-a) + a*255, so it is reversed with (px - a*255)/(1-a).
+    Detection is template based; images without a watermark are untouched.
+    """
+    if not raw or not REMOVE_GEMINI_WATERMARK or _gemini_wm_remove is None:
+        return raw
+    try:
+        cleaned, info = _gemini_wm_remove(raw, min_confidence=WM_MIN_CONFIDENCE)
+    except Exception as e:
+        logger.warning(f"watermark removal skipped: {e}")
+        return raw
+    if info.get("applied"):
+        logger.info(
+            "gemini watermark removed (size=%s pos=%s conf=%s gain=%s)",
+            info.get("size"), info.get("position"), info.get("confidence"),
+            info.get("alpha_gain"),
+        )
+        return cleaned
+    logger.info(f"gemini watermark not detected ({info.get('reason')})")
+    return raw
+
 async def _download_image_bytes(url: str) -> Optional[bytes]:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0",
@@ -1299,6 +1337,7 @@ async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "")
     api_img = await _generate_via_gemini_api(prompt, aspect_ratio)
     if api_img is not None:
         raw, ext = api_img
+        raw = _strip_gemini_watermark(raw)
         await channel.send(file=discord.File(io.BytesIO(raw), filename=f"image{ext}"))
         return f"Generated and sent image via Gemini API to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
 
@@ -1316,7 +1355,7 @@ async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "")
                 data = (r.json().get("data") or [{}])[0]
                 b64 = data.get("b64_json") or ""
                 if b64:
-                    raw = base64.b64decode(b64)
+                    raw = _strip_gemini_watermark(base64.b64decode(b64))
                     await channel.send(file=discord.File(io.BytesIO(raw), filename="image.png"))
                     return f"Generated and sent image to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
         except Exception as e:
@@ -1336,6 +1375,7 @@ async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "")
                 if url:
                     raw = await _download_image_bytes(url)
                     if raw:
+                        raw = _strip_gemini_watermark(raw)
                         await channel.send(file=discord.File(io.BytesIO(raw), filename="image.png"))
                         return f"Generated and sent image to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
         except Exception as e:
@@ -1344,6 +1384,7 @@ async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "")
         # 4. Final fallback: Pollinations (keyless direct JPEG, works when Gemini 429/CDN 403).
         poly, poly_err = await _generate_via_pollinations(client, prompt, aspect_ratio)
         if poly:
+            poly = _strip_gemini_watermark(poly)
             await channel.send(file=discord.File(io.BytesIO(poly), filename="image.jpg"))
             return f"Generated and sent image via Pollinations fallback to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
 
