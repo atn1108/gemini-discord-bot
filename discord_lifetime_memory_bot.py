@@ -8,8 +8,14 @@ import io
 import re
 import asyncio
 import datetime
+import base64
+import html
+import ipaddress
+import socket
+import urllib.parse
+import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import time
 
 logging.basicConfig(level=logging.INFO)
@@ -41,11 +47,20 @@ ENABLE_TOOLS = os.getenv("ENABLE_TOOLS", "true").strip().lower() in ("1", "true"
 # Hard cap on tool round-trips per question so a confused model cannot spin.
 MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "4"))
 
-# ===== DEEP RESEARCH =====
+# ===== DEEP RESEARCH & MEDIA / FILES =====
 DEEP_RESEARCH_URL = os.getenv(
     "DEEP_RESEARCH_URL",
     "https://gemini-web-to-api-production.up.railway.app/gemini/v1beta/deepresearch",
 )
+IMAGE_GEN_URL = os.getenv(
+    "IMAGE_GEN_URL",
+    "https://gemini-web-to-api-production.up.railway.app/openai/v1/images/generations",
+)
+IMAGE_GEN_TIMEOUT = int(os.getenv("IMAGE_GEN_TIMEOUT", "120"))
+GEMINI_COOKIES = os.getenv("GEMINI_COOKIES", "")
+MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(5 * 1024 * 1024)))
+MAX_FILE_TEXT_CHARS = int(os.getenv("MAX_FILE_TEXT_CHARS", "12000"))
+MUSIC_QUEUE_MAX = int(os.getenv("MUSIC_QUEUE_MAX", "50"))
 RESEARCH_TIMEOUT = int(os.getenv("RESEARCH_TIMEOUT", "300"))  # seconds, never hang
 RESEARCH_DEFAULT_SOURCES = int(os.getenv("RESEARCH_DEFAULT_SOURCES", "10"))
 # A message counts as a research request when it starts with one of these
@@ -63,8 +78,8 @@ Bạn là "Bé Yêu", trợ lý AI riêng của một nhóm bạn thân trên Di
 Xưng "em" hoặc "bé", gọi các thành viên theo tên hiển thị (nếu có) hoặc "mọi người". Giọng điệu tự nhiên, lém lỉnh, nhiệt tình như thành viên trong nhóm chat, không sến súa hay giáo điều.
 
 # Operating Loop (Luồng xử lý bắt buộc)
-1. Nhận yêu cầu -> Xác định loại tác vụ (Tin tức/Thời sự | Hỏi đáp nhanh | Code/Học tập | Tán gẫu).
-2. Nếu cần thông tin cập nhật (sau mốc 03/2026, sự kiện, giá cả, thời tiết, công nghệ, tỷ số...) -> **BẮT BUỘC gọi công cụ Google Search trước khi trả lời.**
+1. Nhận yêu cầu -> Xác định loại tác vụ (Tin tức/Thời sự | Hỏi đáp nhanh | Code/Học tập | Nhạc/Ảnh/Tệp | Tán gẫu).
+2. Nếu cần thông tin cập nhật (sau mốc 03/2026, sự kiện, giá cả, thời tiết, công nghệ, tỷ số...) -> **BẮT BUỘC gọi công cụ `web_search` (và `fetch_url` nếu cần đọc chi tiết trang) trước khi trả lời.**
 3. Trả lời thẳng vào trọng tâm ngay từ câu đầu tiên. Cắt bỏ mọi câu rào đón ("Dưới đây là...", "Chào bạn...", "Theo thông tin tìm được...").
 
 # Anti-patterns (Tuyệt đối tránh)
@@ -77,7 +92,11 @@ Xưng "em" hoặc "bé", gọi các thành viên theo tên hiển thị (nếu c
 - Code đặt trong block ```ngôn_ngữ ... ```.
 - Tối ưu độ dài: câu hỏi thường trả lời trong 1–4 câu; hướng dẫn kỹ thuật hoặc tổng hợp tin tức thì chia ý rõ ràng, đủ bước.
 
-# Tool Use (Công cụ quản lý server)
+# Tool Use (Công cụ server, nhạc, web, ảnh, tệp)
+- Khi thành viên yêu cầu phát nhạc ("mở bài...", "bật nhạc...", "skip", "tạm dừng", "dừng nhạc", "xem hàng đợi"), gọi `play_music` hoặc `music_control`. Bé sẽ tự vào kênh voice của người gọi để phát.
+- Khi cần tra cứu web mới nhất hoặc đọc nội dung một link cụ thể, gọi `web_search` / `fetch_url`.
+- Khi thành viên nhờ vẽ/tạo ảnh, gọi `generate_image` (bé tự tạo và gửi ảnh thẳng lên kênh).
+- Khi thành viên nhờ tạo/xuất file (code, markdown, json, csv, txt...), gọi `send_file` để gửi tệp đính kèm thật lên Discord.
 - Khi thành viên yêu cầu thao tác trên server (kick/ban/timeout, tạo/xóa kênh, đổi biệt danh, thêm/bỏ role), gọi tool tương ứng thay vì chỉ hứa làm.
 - Người được nhắc trong tin nhắn đã hiển thị dạng `@Tên(id)` — dùng đúng id đó làm tham số, không tự bịa id.
 - Tool quản trị chỉ chạy khi người yêu cầu là admin; nếu kết quả là DENIED thì báo thẳng người đó không đủ quyền, không thử lại hay lách.
@@ -368,9 +387,9 @@ def render_channels() -> str:
            "Chỉ kênh text nhận được tin nhắn."]
     out += [f"- {t}" for t in text]
     if voice:
-        out.append("Kênh voice/stage — bot không tự join voice và KHÔNG gửi text "
-                   "vào đây; nếu gọi bot nhạc đòi người gọi phải ở trong voice "
-                   "thì báo rõ giới hạn này: " + ", ".join(voice))
+        out.append("Kênh voice/stage — KHÔNG gửi text vào đây; dùng `play_music` "
+                   "/ `music_control` để join voice phát nhạc khi người gọi đang "
+                   "ở trong kênh voice: " + ", ".join(voice))
     return "\n".join(out)
 
 
@@ -489,11 +508,534 @@ TOOLS: List[Dict] = [
             "channel_id": {"type": "string", "description": "Discord channel ID"},
             "content": {"type": "string", "description": "Message text to send"}},
             "required": ["channel_id", "content"]}}},
+    # Music playback in voice channels (safe for everyone).
+    {"type": "function", "function": {
+        "name": "play_music",
+        "description": "Join the caller's voice channel and play or queue music from a song name or URL.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Song name, artist, or YouTube/audio URL"}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "music_control",
+        "description": "Control music playback or view the queue in this server.",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string",
+                       "enum": ["skip", "pause", "resume", "stop", "queue"],
+                       "description": "Playback action to perform"}},
+            "required": ["action"]}}},
+    # Web search & page reader (safe for everyone).
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the live web for current news, prices, weather, facts, or URLs.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Search query"},
+            "max_results": {"type": "integer", "description": "Max results (1-8)"}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "fetch_url",
+        "description": "Fetch and read readable text from a public http/https webpage URL.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "Public http/https URL to read"}},
+            "required": ["url"]}}},
+    # Built-in image generation + auto-fetch to Discord (safe for everyone).
+    {"type": "function", "function": {
+        "name": "generate_image",
+        "description": "Generate an image using the bot's built-in Gemini image generator and post it to the channel.",
+        "parameters": {"type": "object", "properties": {
+            "prompt": {"type": "string", "description": "Detailed visual description of the image to generate"},
+            "aspect_ratio": {"type": "string", "description": "Optional aspect ratio, e.g. 16:9, 1:1, 9:16"}},
+            "required": ["prompt"]}}},
+    # Create & upload a file attachment to Discord (safe for everyone).
+    {"type": "function", "function": {
+        "name": "send_file",
+        "description": "Create a text/code/data file and send it as an attachment in Discord.",
+        "parameters": {"type": "object", "properties": {
+            "filename": {"type": "string", "description": "File name with extension, e.g. report.md, script.py, data.json"},
+            "content": {"type": "string", "description": "Full text contents of the file"},
+            "caption": {"type": "string", "description": "Optional short message sent with the file"},
+            "channel_id": {"type": "string", "description": "Optional target text channel ID (defaults to current channel)"}},
+            "required": ["filename", "content"]}}},
 ]
 
-# Tools that require admin rights. read_channel/send_to_channel are open.
+# Tools that require admin rights.
 DANGEROUS_TOOLS = {"kick", "ban", "timeout", "create_channel", "delete_channel",
                    "set_nickname", "add_role", "remove_role"}
+
+
+# ===== MUSIC PLAYER (per-guild voice queue) =====
+class GuildMusicState:
+    def __init__(self):
+        self.queue: deque = deque(maxlen=MUSIC_QUEUE_MAX)
+        self.current: Optional[Dict[str, Any]] = None
+        self.lock: asyncio.Lock = asyncio.Lock()
+
+
+music_states: Dict[int, GuildMusicState] = defaultdict(GuildMusicState)
+
+
+def _format_duration(seconds) -> str:
+    if not seconds:
+        return "?"
+    sec = int(seconds)
+    m, s = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _extract_track_info(query: str) -> Dict[str, Any]:
+    """Blocking yt-dlp extraction (run via asyncio.to_thread)."""
+    import yt_dlp
+
+    q = query.strip()
+    is_url = q.startswith(("http://", "https://"))
+    target = q if is_url else f"ytsearch1:{q}"
+    opts = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "default_search": "ytsearch",
+        "source_address": "0.0.0.0",
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(target, download=False)
+    if not info:
+        raise ValueError("No matching audio found")
+    if "entries" in info:
+        entries = [e for e in (info.get("entries") or []) if e]
+        if not entries:
+            raise ValueError("No matching audio found")
+        info = entries[0]
+    stream_url = info.get("url")
+    if not stream_url:
+        raise ValueError("No playable audio stream URL returned")
+    return {
+        "title": info.get("title") or q,
+        "stream_url": stream_url,
+        "webpage_url": info.get("webpage_url") or (q if is_url else ""),
+        "duration": info.get("duration") or 0,
+    }
+
+
+def _create_audio_source(stream_url: str):
+    return discord.FFmpegPCMAudio(
+        stream_url,
+        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        options="-vn",
+    )
+
+
+async def _play_next_track(guild: discord.Guild) -> None:
+    state = music_states[guild.id]
+    async with state.lock:
+        vc = getattr(guild, "voice_client", None)
+        if vc is None or not getattr(vc, "is_connected", lambda: True)():
+            state.current = None
+            state.queue.clear()
+            return
+        if not state.queue:
+            state.current = None
+            return
+        nxt = state.queue.popleft()
+        # Re-resolve stream URL when starting a queued track so links never go stale.
+        if nxt.get("webpage_url") and nxt.get("_queued"):
+            try:
+                fresh = await asyncio.to_thread(_extract_track_info, nxt["webpage_url"])
+                nxt["stream_url"] = fresh["stream_url"]
+            except Exception as e:
+                logger.warning(f"queued track refresh failed for {nxt.get('title')}: {e}")
+        state.current = nxt
+        try:
+            source = _create_audio_source(nxt["stream_url"])
+            loop = getattr(bot, "loop", None) or asyncio.get_running_loop()
+
+            def _after(err):
+                if err:
+                    logger.warning(f"voice playback error in {guild.id}: {err}")
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(_play_next_track(guild))
+                )
+
+            vc.play(source, after=_after)
+        except Exception as e:
+            logger.warning(f"vc.play failed in {guild.id}: {e}")
+            state.current = None
+            asyncio.create_task(_play_next_track(guild))
+
+
+async def _handle_play_music(guild: discord.Guild, caller: Optional[discord.Member],
+                             query: str) -> str:
+    query = (query or "").strip()
+    if not query:
+        return "ERROR: missing song name or URL"
+    voice_state = getattr(caller, "voice", None)
+    voice_ch = getattr(voice_state, "channel", None)
+    if voice_ch is None:
+        return "ERROR: Caller is not in a voice channel. Ask them to join a voice channel first."
+
+    vc = getattr(guild, "voice_client", None)
+    if vc is None:
+        vc = await voice_ch.connect()
+    elif getattr(vc, "channel", None) != voice_ch:
+        await vc.move_to(voice_ch)
+
+    track = await asyncio.to_thread(_extract_track_info, query)
+    track["requester"] = getattr(caller, "display_name", "?")
+    state = music_states[guild.id]
+    if vc.is_playing() or vc.is_paused():
+        if len(state.queue) >= MUSIC_QUEUE_MAX:
+            return f"ERROR: Music queue is full ({MUSIC_QUEUE_MAX} tracks)."
+        track["_queued"] = True
+        state.queue.append(track)
+        return (f"Queued #{len(state.queue)}: {track['title']} "
+                f"({_format_duration(track['duration'])}) in #{voice_ch.name}")
+
+    state.queue.appendleft(track)
+    await _play_next_track(guild)
+    return (f"Now playing in #{voice_ch.name}: {track['title']} "
+            f"({_format_duration(track['duration'])})")
+
+
+async def _handle_music_control(guild: discord.Guild, action: str) -> str:
+    action = (action or "").strip().lower()
+    state = music_states[guild.id]
+    vc = getattr(guild, "voice_client", None)
+    if action == "queue":
+        lines = []
+        if state.current:
+            lines.append(
+                f"Now playing: {state.current['title']} "
+                f"({_format_duration(state.current.get('duration'))})"
+            )
+        for idx, t in enumerate(list(state.queue)[:10], 1):
+            lines.append(f"{idx}. {t['title']} ({_format_duration(t.get('duration'))})")
+        return "\n".join(lines) if lines else "Queue is empty."
+
+    if vc is None:
+        return "ERROR: Bot is not currently in a voice channel."
+    if action == "skip":
+        if not vc.is_playing() and not vc.is_paused():
+            return "Nothing is currently playing."
+        vc.stop()  # Triggers _after -> _play_next_track
+        return "Skipped current track."
+    if action == "pause":
+        if vc.is_playing():
+            vc.pause()
+            return "Paused playback."
+        return "Nothing is playing right now."
+    if action == "resume":
+        if vc.is_paused():
+            vc.resume()
+            return "Resumed playback."
+        return "Playback is not paused."
+    if action == "stop":
+        state.queue.clear()
+        state.current = None
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+        await vc.disconnect()
+        return "Stopped music, cleared queue, and left voice channel."
+    return f"ERROR: unknown music action '{action}'"
+
+
+# ===== WEB SEARCH & URL FETCH =====
+def _is_safe_public_url(raw_url: str) -> tuple[bool, str]:
+    """Block non-http(s) URLs and private/loopback/link-local hosts (SSRF guard)."""
+    try:
+        parsed = urllib.parse.urlparse((raw_url or "").strip())
+    except Exception:
+        return False, "invalid URL"
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False, "only public http/https URLs are allowed"
+    host = parsed.hostname.lower()
+    if host in ("localhost", "localhost.localdomain"):
+        return False, "localhost is blocked"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError as e:
+        return False, f"DNS lookup failed: {e}"
+    for info in infos:
+        ip_str = info[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            return False, f"private/reserved IP blocked ({ip_str})"
+    return True, ""
+
+
+def _strip_html(raw: str) -> str:
+    cleaned = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", raw)
+    cleaned = re.sub(r"(?s)<[^>]+>", " ", cleaned)
+    cleaned = html.unescape(cleaned)
+    return " ".join(cleaned.split())
+
+
+def _parse_rss_items(xml_text: str, limit: int) -> List[Dict[str, str]]:
+    root = ET.fromstring(xml_text)
+    out = []
+    for item in root.findall(".//item"):
+        t_el = item.find("title")
+        d_el = item.find("description")
+        title = _strip_html("".join(t_el.itertext()) if t_el is not None else "")
+        link = (item.findtext("link") or "").strip()
+        desc = _strip_html("".join(d_el.itertext()) if d_el is not None else "")
+        pub = (item.findtext("pubDate") or "").strip()
+        if title and link:
+            out.append({"title": title, "link": link, "desc": desc[:240], "pub": pub})
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _web_search(query: str, max_results: int = 5) -> str:
+    query = (query or "").strip()
+    if not query:
+        return "ERROR: empty search query"
+    limit = max(1, min(int(max_results or 5), 8))
+    q = urllib.parse.quote(query)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
+    }
+    results: List[Dict[str, str]] = []
+    seen_urls = set()
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
+        for url in (
+            f"https://www.bing.com/search?q={q}&format=rss",
+            f"https://news.google.com/rss/search?q={q}&hl=vi&gl=VN&ceid=VN:vi",
+        ):
+            try:
+                r = await client.get(url)
+                if r.status_code == 200 and "<item>" in r.text:
+                    for item in _parse_rss_items(r.text, limit):
+                        if item["link"] in seen_urls:
+                            continue
+                        seen_urls.add(item["link"])
+                        results.append(item)
+                        if len(results) >= limit + 2:
+                            break
+            except Exception as e:
+                logger.warning(f"web_search fetch failed ({url[:40]}): {e}")
+    if not results:
+        return "No web search results found."
+    lines = []
+    for i, item in enumerate(results[:limit + 2], 1):
+        meta = f" ({item['pub']})" if item["pub"] else ""
+        snippet = f" — {item['desc']}" if item["desc"] else ""
+        lines.append(f"{i}. {item['title']}{meta}\n   URL: {item['link']}{snippet}")
+    return "\n".join(lines)
+
+
+async def _fetch_url(url: str) -> str:
+    cur = (url or "").strip()
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0"}
+    async with httpx.AsyncClient(timeout=15, follow_redirects=False, headers=headers) as client:
+        resp = None
+        for _ in range(5):
+            ok, reason = _is_safe_public_url(cur)
+            if not ok:
+                return f"ERROR: blocked URL ({reason})"
+            resp = await client.get(cur)
+            if resp.is_redirect and resp.headers.get("location"):
+                cur = urllib.parse.urljoin(cur, resp.headers["location"])
+                continue
+            break
+        if resp is None:
+            return "ERROR: failed to fetch URL"
+        resp.raise_for_status()
+        ct = (resp.headers.get("content-type") or "").lower()
+        if "html" in ct or not ct:
+            text = _strip_html(resp.text)
+        elif ct.startswith("text/") or "json" in ct or "xml" in ct:
+            text = resp.text
+        else:
+            return f"Fetched non-text content ({ct}, {len(resp.content)} bytes)."
+        text = text.strip()
+        if not text:
+            return "(page has no readable text)"
+        return text[:4000] + ("…" if len(text) > 4000 else "")
+
+
+# ===== BUILT-IN IMAGE GENERATION & AUTO-FETCH =====
+async def _download_image_bytes(url: str) -> Optional[bytes]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0",
+        "Referer": "https://gemini.google.com/",
+    }
+    if GEMINI_COOKIES:
+        headers["Cookie"] = GEMINI_COOKIES
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        for candidate in (url, f"{url}=s2048-rj"):
+            try:
+                r = await client.get(candidate, headers=headers)
+                if r.status_code == 200 and (r.headers.get("content-type") or "").startswith("image/"):
+                    return r.content
+            except Exception:
+                continue
+    return None
+
+
+async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "") -> str:
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return "ERROR: empty image prompt"
+    full_prompt = f"{prompt} (aspect ratio {aspect_ratio.strip()})" if aspect_ratio.strip() else prompt
+    async with httpx.AsyncClient(timeout=IMAGE_GEN_TIMEOUT) as client:
+        # First try b64_json so the upstream service handles Google cookies.
+        try:
+            r = await client.post(IMAGE_GEN_URL, json={
+                "prompt": full_prompt,
+                "model": "gemini-auto",
+                "n": 1,
+                "response_format": "b64_json",
+            })
+            if r.status_code == 200:
+                data = (r.json().get("data") or [{}])[0]
+                b64 = data.get("b64_json") or ""
+                if b64:
+                    raw = base64.b64decode(b64)
+                    await channel.send(file=discord.File(io.BytesIO(raw), filename="image.png"))
+                    return f"Generated and sent image to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
+        except Exception as e:
+            logger.warning(f"image b64_json failed: {e}")
+
+        # Fallback: request URL and attempt direct fetch.
+        r2 = await client.post(IMAGE_GEN_URL, json={
+            "prompt": full_prompt,
+            "model": "gemini-auto",
+            "n": 1,
+            "response_format": "url",
+        })
+        r2.raise_for_status()
+        url = ((r2.json().get("data") or [{}])[0]).get("url") or ""
+        if not url:
+            return "ERROR: image generator returned no image"
+        raw = await _download_image_bytes(url)
+        if raw:
+            await channel.send(file=discord.File(io.BytesIO(raw), filename="image.png"))
+            return f"Generated and sent image to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
+        return (f"IMAGE_FETCH_BLOCKED: Gemini generated the image at {url} "
+                f"but Google CDN returned HTTP 403 when fetching the file bytes directly. "
+                f"Share this link with the user and explain the 403 CDN limitation.")
+
+
+# ===== FILE CREATION & ATTACHMENT READING =====
+def _sanitize_filename(name: str) -> str:
+    base = os.path.basename((name or "").strip())
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._")
+    return (base or "output.txt")[:100]
+
+
+async def _handle_send_file(guild: discord.Guild, default_channel, args: Dict) -> str:
+    content = args.get("content")
+    if content is None or content == "":
+        return "ERROR: file content cannot be empty"
+    raw = str(content).encode("utf-8")
+    if len(raw) > 8 * 1024 * 1024:
+        return "ERROR: file exceeds 8 MB Discord limit"
+    cid = str(args.get("channel_id") or "").strip()
+    target = guild.get_channel(int(cid)) if cid.isdigit() else default_channel
+    if target is None:
+        return "ERROR: target channel not found"
+    if not hasattr(target, "send"):
+        return (f"ERROR: #{getattr(target, 'name', target.id)} is a "
+                f"voice/stage channel and cannot receive files")
+    fname = _sanitize_filename(args.get("filename") or "output.txt")
+    caption = (args.get("caption") or "").strip()[:1900] or None
+    await target.send(content=caption, file=discord.File(io.BytesIO(raw), filename=fname))
+    return f"Sent file '{fname}' ({len(raw)} bytes) to #{getattr(target, 'name', target.id)}"
+
+
+def _extract_pdf_text(data: bytes) -> str:
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(data))
+    chunks = []
+    total = 0
+    for idx, page in enumerate(reader.pages, 1):
+        txt = (page.extract_text() or "").strip()
+        if not txt:
+            continue
+        piece = f"[Page {idx}]\n{txt}"
+        chunks.append(piece)
+        total += len(piece)
+        if total >= MAX_FILE_TEXT_CHARS:
+            break
+    return "\n\n".join(chunks)[:MAX_FILE_TEXT_CHARS]
+
+
+_TEXT_EXTS = {
+    ".txt", ".md", ".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".csv",
+    ".yaml", ".yml", ".xml", ".html", ".css", ".sql", ".sh", ".log", ".ini",
+    ".toml", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".env",
+}
+
+
+async def extract_attachments(attachments) -> tuple[str, List[Dict[str, Any]]]:
+    """Read Discord attachments into text blocks and OpenAI image/PDF parts."""
+    items = list(attachments or [])[:3]
+    if not items:
+        return "", []
+    text_blocks: List[str] = []
+    media_parts: List[Dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        for att in items:
+            name = getattr(att, "filename", None) or "file"
+            size = int(getattr(att, "size", 0) or 0)
+            ct = (getattr(att, "content_type", None) or "").split(";")[0].strip().lower()
+            ext = os.path.splitext(name.lower())[1]
+            if size and size > MAX_ATTACHMENT_BYTES:
+                text_blocks.append(f"[Tệp quá lớn (>5MB): {name}]")
+                continue
+            try:
+                if hasattr(att, "read"):
+                    data = await att.read()
+                else:
+                    r = await client.get(getattr(att, "url", ""))
+                    r.raise_for_status()
+                    data = r.content
+            except Exception as e:
+                text_blocks.append(f"[Không tải được tệp {name}: {e}]")
+                continue
+            if len(data) > MAX_ATTACHMENT_BYTES:
+                text_blocks.append(f"[Tệp quá lớn (>5MB): {name}]")
+                continue
+
+            if ct.startswith("image/") or ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+                mime = ct if ct.startswith("image/") else f"image/{ext.lstrip('.') or 'png'}"
+                if mime == "image/jpg":
+                    mime = "image/jpeg"
+                b64 = base64.b64encode(data).decode("ascii")
+                media_parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                text_blocks.append(f"[Ảnh đính kèm: {name}]")
+                continue
+
+            if ct == "application/pdf" or ext == ".pdf":
+                pdf_text = ""
+                try:
+                    pdf_text = await asyncio.to_thread(_extract_pdf_text, data)
+                except Exception as e:
+                    logger.warning(f"PDF parse failed for {name}: {e}")
+                if pdf_text.strip():
+                    text_blocks.append(f"[Nội dung PDF: {name}]\n{pdf_text}")
+                else:
+                    b64 = base64.b64encode(data).decode("ascii")
+                    media_parts.append({"type": "image_url", "image_url": {"url": f"data:application/pdf;base64,{b64}"}})
+                    text_blocks.append(f"[PDF đính kèm (scan): {name}]")
+                continue
+
+            if ct.startswith("text/") or ext in _TEXT_EXTS or (b"\x00" not in data[:4096]):
+                decoded = data.decode("utf-8", errors="replace")
+                if len(decoded) > MAX_FILE_TEXT_CHARS:
+                    decoded = decoded[:MAX_FILE_TEXT_CHARS] + "\n…(truncated)"
+                text_blocks.append(f"[Nội dung tệp: {name}]\n```\n{decoded}\n```")
+            else:
+                text_blocks.append(f"[Tệp nhị phân đính kèm: {name} ({len(data)} bytes, {ct or 'unknown'})]")
+    return "\n\n".join(text_blocks), media_parts
 
 
 async def is_admin(member: Optional[discord.Member], guild: Optional[discord.Guild]) -> bool:
@@ -619,7 +1161,17 @@ async def execute_tool(name: str, args: Dict, guild: discord.Guild,
             lines = []
             async for m in target.history(limit=limit):
                 who = getattr(m.author, "display_name", "?")
-                lines.append(f"[{who}] {m.content[:200]}")
+                body = (getattr(m, "content", "") or "").strip()
+                if not body and getattr(m, "embeds", None):
+                    emb_parts = []
+                    for emb in m.embeds[:2]:
+                        t = getattr(emb, "title", None) or ""
+                        d = getattr(emb, "description", None) or ""
+                        piece = f"{t}: {d}".strip(": ")
+                        if piece:
+                            emb_parts.append(piece)
+                    body = " | ".join(emb_parts)
+                lines.append(f"[{who}] {body[:300]}")
             return "\n".join(reversed(lines)) or "(no messages)"
 
         if name == "send_to_channel":
@@ -632,6 +1184,25 @@ async def execute_tool(name: str, args: Dict, guild: discord.Guild,
             content = (args.get("content") or "")[:1900]
             await target.send(content)
             return f"Sent to channel {target.id}"
+
+        if name == "play_music":
+            return await _handle_play_music(guild, caller, args.get("query") or "")
+
+        if name == "music_control":
+            return await _handle_music_control(guild, args.get("action") or "")
+
+        if name == "web_search":
+            return await _web_search(args.get("query") or "", args.get("max_results") or 5)
+
+        if name == "fetch_url":
+            return await _fetch_url(args.get("url") or "")
+
+        if name == "generate_image":
+            return await _generate_and_send_image(
+                channel, args.get("prompt") or "", args.get("aspect_ratio") or "")
+
+        if name == "send_file":
+            return await _handle_send_file(guild, channel, args)
 
         return f"ERROR: unknown tool '{name}'"
     except Exception as e:
@@ -985,8 +1556,9 @@ async def on_message(message):
     if message.author.bot:
         return
     
+    msg_atts = list(getattr(message, "attachments", None) or [])
     content = (message.content or "").strip()
-    if not content:
+    if not content and not msg_atts:
         return
 
     content, mentioned = strip_mentions(
@@ -1003,8 +1575,8 @@ async def on_message(message):
             message, bot.user.id if bot.user else 0)
     if not mentioned and is_reply_to_bot:
         mentioned = True
-    if not content and mentioned:
-        content = "alo"
+    if not content and (mentioned or msg_atts):
+        content = "đọc tệp đính kèm này giúp bé" if msg_atts and mentioned else "alo"
 
     # Deep Research — "nghiên cứu X", "research X", "bot nghiên cứu X"
     topic = research_query(content)
@@ -1016,9 +1588,10 @@ async def on_message(message):
     # Prefix the sender so the model knows who is talking (see system prompt
     # persona); a reply carries the quoted message too, so tagging mid-argument
     # needs no re-explanation.
-    turn = {"role": "user",
-            "content": (render_reply_context(target)
-                        + f"[{message.author.display_name}]: {content}")[:STORE_MAX]}
+    att_names = ", ".join(getattr(a, "filename", "file") for a in msg_atts[:3])
+    att_note = f" (đính kèm: {att_names})" if att_names else ""
+    base_text = render_reply_context(target) + f"[{message.author.display_name}]: {content}{att_note}"
+    turn = {"role": "user", "content": base_text[:STORE_MAX]}
 
     if not mentioned and not any(kw in content.lower() for kw in KEYWORDS):
         # Plain chatter: keep it as context for the next tag, do not answer.
@@ -1046,17 +1619,29 @@ async def on_message(message):
             await message.reply(f"🗑️ Đã quên {deleted} điều khớp **{pattern}**.")
         return
 
+    # Extract file/image attachments from this message (or the replied message).
+    atts_to_read = msg_atts or list(getattr(target, "attachments", None) or [])
+    att_text, media_parts = await extract_attachments(atts_to_read)
+    live_text = base_text + ("\n\n" + att_text if att_text else "")
+    stored_turn = {"role": "user", "content": live_text[:STORE_MAX]}
+    live_turn: Dict[str, Any] = (
+        {"role": "user", "content": [{"type": "text", "text": live_text}] + media_parts}
+        if media_parts else {"role": "user", "content": live_text}
+    )
+
     logger.info(f"ask from {message.author.display_name} (mention={mentioned}): {content[:80]!r}")
     channel_id = message.channel.id
     async with channel_locks[channel_id]:
         # Stored transcript + chatter since the last answer + this message, so
         # the model already knows what the group was talking about.
         history = await get_history(channel_id)
-        messages = history + list(pending.get(channel_id, ())) + [turn]
+        prior = history + list(pending.get(channel_id, ()))
+        live_messages = prior + [live_turn]
+        messages = prior + [stored_turn]
 
         async with message.channel.typing():
             success, result = await run_tool_loop(
-                messages, channel_id,
+                live_messages, channel_id,
                 guild=getattr(message, "guild", None),
                 channel=message.channel,
                 caller=message.author,

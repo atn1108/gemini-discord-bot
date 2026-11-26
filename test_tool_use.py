@@ -606,6 +606,276 @@ check("schema: dangerous list is a subset of TOOLS",
 check("schema: safe tools exist for non-admins",
       set(names) - bot_mod.DANGEROUS_TOOLS, str(set(names) - bot_mod.DANGEROUS_TOOLS))
 
+# ---------- 7. music, web search, image gen, attachments, send_file ----------
+
+# 7a. music player & queue
+async def music_checks():
+    class FakeVC:
+        def __init__(self, ch):
+            self.channel = ch
+            self.playing = False
+            self.paused = False
+            self.played = []
+            self.disconnected = False
+
+        def is_connected(self):
+            return not self.disconnected
+
+        def is_playing(self):
+            return self.playing
+
+        def is_paused(self):
+            return self.paused
+
+        def play(self, source, after=None):
+            self.playing = True
+            self.paused = False
+            self.played.append((source, after))
+
+        def pause(self):
+            self.playing = False
+            self.paused = True
+
+        def resume(self):
+            self.paused = False
+            self.playing = True
+
+        def stop(self):
+            self.playing = False
+            self.paused = False
+
+        async def move_to(self, ch):
+            self.channel = ch
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    class FakeVoiceChannel:
+        def __init__(self, name="Nhac"):
+            self.name = name
+            self.vc = None
+
+        async def connect(self):
+            self.vc = FakeVC(self)
+            return self.vc
+
+    class MusicGuild:
+        def __init__(self, gid=9001):
+            self.id = gid
+            self._vc = None
+
+        @property
+        def voice_client(self):
+            return self._vc
+
+    g = MusicGuild()
+    no_voice_caller = type("M", (), {"display_name": "Minh", "voice": None})()
+    got = await bot_mod.execute_tool("play_music", {"query": "lac troi"}, g, None, no_voice_caller, False)
+    check("music: refuses if caller not in voice", "ERROR" in got and "voice" in got, got)
+
+    vch = FakeVoiceChannel("Phong Nhac")
+
+    async def connect_and_attach():
+        g._vc = FakeVC(vch)
+        return g._vc
+
+    vch.connect = connect_and_attach
+    caller = type("M", (), {
+        "display_name": "Minh",
+        "voice": type("V", (), {"channel": vch})(),
+    })()
+
+    real_extract = bot_mod._extract_track_info
+    real_source = bot_mod._create_audio_source
+    bot_mod._extract_track_info = lambda q: {
+        "title": f"Track:{q}", "stream_url": f"https://cdn/{q}",
+        "webpage_url": f"https://yt/{q}", "duration": 185,
+    }
+    bot_mod._create_audio_source = lambda u: f"SRC:{u}"
+    try:
+        r1 = await bot_mod.execute_tool("play_music", {"query": "lac troi"}, g, None, caller, False)
+        check("music: starts playing immediately", "Now playing" in r1 and "Track:lac troi" in r1, r1)
+        check("music: vc.play received source", g._vc.played and g._vc.played[0][0] == "SRC:https://cdn/lac troi")
+
+        r2 = await bot_mod.execute_tool("play_music", {"query": "chung ta cua hien tai"}, g, None, caller, False)
+        check("music: second song queued", "Queued #1" in r2 and "chung ta" in r2, r2)
+
+        qtxt = await bot_mod.execute_tool("music_control", {"action": "queue"}, g, None, caller, False)
+        check("music: queue lists current and upcoming", "Now playing: Track:lac troi" in qtxt and "1. Track:chung ta cua hien tai" in qtxt, qtxt)
+
+        p1 = await bot_mod.execute_tool("music_control", {"action": "pause"}, g, None, caller, False)
+        check("music: pause works", "Paused" in p1 and g._vc.is_paused())
+        p2 = await bot_mod.execute_tool("music_control", {"action": "resume"}, g, None, caller, False)
+        check("music: resume works", "Resumed" in p2 and g._vc.is_playing())
+        sk = await bot_mod.execute_tool("music_control", {"action": "skip"}, g, None, caller, False)
+        check("music: skip stops current track", "Skipped" in sk and not g._vc.is_playing())
+        st = await bot_mod.execute_tool("music_control", {"action": "stop"}, g, None, caller, False)
+        check("music: stop disconnects and clears queue", "Stopped" in st and g._vc.disconnected and not bot_mod.music_states[g.id].queue)
+    finally:
+        bot_mod._extract_track_info = real_extract
+        bot_mod._create_audio_source = real_source
+        bot_mod.music_states.pop(g.id, None)
+
+
+run_now(music_checks())
+
+# 7b. web search & SSRF guard
+check("ssrf: blocks file://", not bot_mod._is_safe_public_url("file:///etc/passwd")[0])
+check("ssrf: blocks localhost", not bot_mod._is_safe_public_url("http://localhost:8000")[0])
+check("ssrf: blocks 127.0.0.1", not bot_mod._is_safe_public_url("http://127.0.0.1/admin")[0])
+check("ssrf: blocks AWS/GCP metadata IP", not bot_mod._is_safe_public_url("http://169.254.169.254/latest")[0])
+check("html: strips scripts and tags",
+      bot_mod._strip_html("<html><script>alert(1)</script><body><h1>Hi &amp; Bye</h1></body></html>") == "Hi & Bye")
+rss_sample = "<rss><channel><item><title>Vang <b>SJC</b></title><link>https://example.com/gold</link><description>90 trieu</description><pubDate>Thu, 26 Nov 2026</pubDate></item></channel></rss>"
+parsed_rss = bot_mod._parse_rss_items(rss_sample, 5)
+check("rss: parses title, link, desc", len(parsed_rss) == 1 and parsed_rss[0]["title"] == "Vang SJC" and parsed_rss[0]["link"] == "https://example.com/gold")
+
+# 7c. send_file & read_channel embed fallback
+async def file_and_embed_checks():
+    sent_files = []
+
+    class FileChan:
+        id = 555
+        name = "chat-chung"
+
+        async def send(self, content=None, file=None):
+            sent_files.append((content, file.filename, file.fp.read()))
+
+        async def history(self, limit=5):
+            yield type("M", (), {
+                "author": type("A", (), {"display_name": "Carl-bot"})(),
+                "content": "",
+                "embeds": [type("E", (), {"title": "About Carl", "description": "Uptime 99%"})()],
+            })()
+
+    class FileGuild:
+        def get_channel(self, cid):
+            return FileChan() if cid == 555 else None
+
+    fch = FileChan()
+    fg = FileGuild()
+    got = await bot_mod.execute_tool("send_file", {
+        "filename": "../../hello world.py",
+        "content": "print('ok')",
+        "caption": "Day ne",
+    }, fg, fch, None, False)
+    check("file: sanitized filename and sent",
+          "Sent file 'hello_world.py'" in got and sent_files[-1][1] == "hello_world.py" and sent_files[-1][2] == b"print('ok')",
+          got)
+    bad = await bot_mod.execute_tool("send_file", {"filename": "a.txt", "content": ""}, fg, fch, None, False)
+    check("file: empty content rejected", "ERROR" in bad, bad)
+
+    rd = await bot_mod.execute_tool("read_channel", {"channel_id": "555", "limit": 1}, fg, fch, None, False)
+    check("read_channel: extracts embed text when content is empty",
+          "[Carl-bot] About Carl: Uptime 99%" in rd, rd)
+
+
+run_now(file_and_embed_checks())
+
+# 7d. generate_image auto-fetch (b64_json) & 403 CDN fallback
+async def image_gen_checks():
+    import base64
+    sent_imgs = []
+
+    class ImgChan:
+        id = 777
+        name = "art"
+
+        async def send(self, content=None, file=None):
+            sent_imgs.append((file.filename, file.fp.read()))
+
+    class FakeResp:
+        def __init__(self, code, data):
+            self.status_code = code
+            self._data = data
+
+        def json(self):
+            return self._data
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+    png_bytes = b"\x89PNG\r\n\x1a\nFAKEPNG"
+
+    class FakeClientB64:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None):
+            return FakeResp(200, {"data": [{"b64_json": base64.b64encode(png_bytes).decode()}]})
+
+    real_client = bot_mod.httpx.AsyncClient
+    bot_mod.httpx.AsyncClient = FakeClientB64
+    try:
+        out = await bot_mod._generate_and_send_image(ImgChan(), "cute cat", "1:1")
+        check("img: b64_json auto-sent to Discord", "Generated and sent image" in out and sent_imgs[0][1] == png_bytes, out)
+    finally:
+        bot_mod.httpx.AsyncClient = real_client
+
+    class FakeClient403(FakeClientB64):
+        async def post(self, url, json=None):
+            if (json or {}).get("response_format") == "b64_json":
+                return FakeResp(500, {"error": "403"})
+            return FakeResp(200, {"data": [{"url": "https://lh3.googleusercontent.com/gg-dl/test"}]})
+
+    async def no_dl(_url):
+        return None
+
+    real_dl = bot_mod._download_image_bytes
+    bot_mod.httpx.AsyncClient = FakeClient403
+    bot_mod._download_image_bytes = no_dl
+    try:
+        out2 = await bot_mod._generate_and_send_image(ImgChan(), "cute cat")
+        check("img: 403 CDN fallback reports URL honestly",
+              "IMAGE_FETCH_BLOCKED" in out2 and "lh3.googleusercontent.com" in out2, out2)
+    finally:
+        bot_mod.httpx.AsyncClient = real_client
+        bot_mod._download_image_bytes = real_dl
+
+
+run_now(image_gen_checks())
+
+# 7e. attachment reading (text, PDF, image -> multimodal live payload, plain text in DB)
+async def attachment_checks():
+    import io
+    # Minimal valid 1-page PDF with text "Hello PDF" generated or mocked via _extract_pdf_text
+    class FakeAtt:
+        def __init__(self, filename, data, ct):
+            self.filename = filename
+            self._data = data
+            self.size = len(data)
+            self.content_type = ct
+
+        async def read(self):
+            return self._data
+
+    real_pdf = bot_mod._extract_pdf_text
+    bot_mod._extract_pdf_text = lambda data: "[Page 1]\nHello PDF World"
+    try:
+        txt, media = await bot_mod.extract_attachments([
+            FakeAtt("notes.py", b"x = 42\n", "text/x-python"),
+            FakeAtt("doc.pdf", b"%PDF-1.4...", "application/pdf"),
+            FakeAtt("pic.png", b"\x89PNG\r\n\x1a\n", "image/png"),
+        ])
+    finally:
+        bot_mod._extract_pdf_text = real_pdf
+
+    check("att: text file extracted", "[Nội dung tệp: notes.py]" in txt and "x = 42" in txt, txt[:100])
+    check("att: pdf text extracted", "[Nội dung PDF: doc.pdf]" in txt and "Hello PDF World" in txt)
+    check("att: image encoded as OpenAI image_url data URI",
+          len(media) == 1 and media[0]["type"] == "image_url"
+          and media[0]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+
+run_now(attachment_checks())
+
 print()
 if failures:
     print(f"FAILED: {failures}")
