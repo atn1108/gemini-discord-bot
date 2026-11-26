@@ -729,6 +729,24 @@ check("html: strips scripts and tags",
 rss_sample = "<rss><channel><item><title>Vang <b>SJC</b></title><link>https://example.com/gold</link><description>90 trieu</description><pubDate>Thu, 26 Nov 2026</pubDate></item></channel></rss>"
 parsed_rss = bot_mod._parse_rss_items(rss_sample, 5)
 check("rss: parses title, link, desc", len(parsed_rss) == 1 and parsed_rss[0]["title"] == "Vang SJC" and parsed_rss[0]["link"] == "https://example.com/gold")
+check("gnews: vi locale for Vietnamese query", "hl=vi&gl=VN" in bot_mod._google_news_rss_url("giá vàng hôm nay"))
+check("gnews: en locale for ASCII query", "hl=en-US&gl=US" in bot_mod._google_news_rss_url("latest AI model 2026"))
+
+
+async def prompt_date_check():
+    real_facts, real_bots, real_b = bot_mod.get_facts, bot_mod.get_peer_bots, bot_mod.bot
+    async def _no(): return []
+    async def _one_fact(): return [{"fact": "a", "author": ""}]
+    bot_mod.get_facts, bot_mod.get_peer_bots = _one_fact, _no
+    try:
+        built = await bot_mod.build_system_prompt()
+        check("prompt: injects live date and 03/2026 web_search reminder",
+              "# Thời gian hiện tại" in built and "03/2026" in built and "web_search" in built, built[:200])
+    finally:
+        bot_mod.get_facts, bot_mod.get_peer_bots, bot_mod.bot = real_facts, real_bots, real_b
+
+
+run_now(prompt_date_check())
 
 # 7c. send_file & read_channel embed fallback
 async def file_and_embed_checks():

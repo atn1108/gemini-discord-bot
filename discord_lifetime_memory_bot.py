@@ -394,13 +394,23 @@ def render_channels() -> str:
 
 
 async def build_system_prompt() -> str:
-    """Persona + remembered facts + the peer bots discovered in this server."""
+    """Persona + remembered facts + peer bots + channels + live date."""
     facts = await get_facts()
     bots = await get_peer_bots()
     channels = render_channels()
     if not facts and not bots and not channels:
         return SYSTEM_PROMPT
     parts = [SYSTEM_PROMPT]
+    now_vn = datetime.datetime.now(
+        datetime.timezone(datetime.timedelta(hours=7))
+    ).strftime("%d/%m/%Y %H:%M (UTC+7)")
+    parts.append(
+        f"# Thời gian hiện tại\n"
+        f"Hiện tại là {now_vn}. Dữ liệu huấn luyện gốc của bạn chỉ tới mốc 03/2026. "
+        f"Với mọi câu hỏi về sự kiện, tin tức, giá cả, thời tiết, phiên bản/model mới, "
+        f"tỷ số hay dữ liệu sau 03/2026, BẮT BUỘC gọi `web_search` (và `fetch_url` nếu "
+        f"cần đọc số liệu chi tiết từ trang) trước khi trả lời — tuyệt đối không bịa."
+    )
     if facts:
         lines = "\n".join(
             f"- {f['fact']} (do {f['author']} nhờ nhớ)" if f["author"] else f"- {f['fact']}"
@@ -790,40 +800,75 @@ def _parse_rss_items(xml_text: str, limit: int) -> List[Dict[str, str]]:
     return out
 
 
+def _ddgs_search(query: str, limit: int) -> List[Dict[str, str]]:
+    """Run blocking ddgs text + news search in a worker thread."""
+    from ddgs import DDGS
+
+    out: List[Dict[str, str]] = []
+    seen = set()
+    client = DDGS()
+    for method in ("text", "news"):
+        try:
+            rows = list(getattr(client, method)(query, max_results=limit))
+        except Exception:
+            rows = []
+        for r in rows:
+            link = (r.get("href") or r.get("url") or "").strip()
+            title = (r.get("title") or "").strip()
+            desc = (r.get("body") or "").strip()
+            pub = (r.get("date") or "").strip()
+            if title and link and link not in seen:
+                seen.add(link)
+                out.append({"title": title, "link": link, "desc": desc[:240], "pub": pub})
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _google_news_rss_url(query: str) -> str:
+    q = urllib.parse.quote(query)
+    if any(ord(ch) > 127 for ch in query):
+        return f"https://news.google.com/rss/search?q={q}&hl=vi&gl=VN&ceid=VN:vi"
+    return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+
+
 async def _web_search(query: str, max_results: int = 5) -> str:
     query = (query or "").strip()
     if not query:
         return "ERROR: empty search query"
     limit = max(1, min(int(max_results or 5), 8))
-    q = urllib.parse.quote(query)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
-    }
     results: List[Dict[str, str]] = []
     seen_urls = set()
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
-        for url in (
-            f"https://www.bing.com/search?q={q}&format=rss",
-            f"https://news.google.com/rss/search?q={q}&hl=vi&gl=VN&ceid=VN:vi",
-        ):
-            try:
-                r = await client.get(url)
-                if r.status_code == 200 and "<item>" in r.text:
-                    for item in _parse_rss_items(r.text, limit):
-                        if item["link"] in seen_urls:
-                            continue
+
+    # 1. Direct web & news search via ddgs (returns direct publisher URLs for fetch_url).
+    try:
+        for item in await asyncio.to_thread(_ddgs_search, query, limit):
+            if item["link"] not in seen_urls:
+                seen_urls.add(item["link"])
+                results.append(item)
+    except Exception as e:
+        logger.warning(f"ddgs search failed: {e}")
+
+    # 2. Live Google News RSS (fresh dated headlines, resilient fallback).
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0"}
+    gnews_url = _google_news_rss_url(query)
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=headers) as client:
+            r = await client.get(gnews_url)
+            if r.status_code == 200 and "<item>" in r.text:
+                for item in _parse_rss_items(r.text, max(3, limit)):
+                    if item["link"] not in seen_urls:
                         seen_urls.add(item["link"])
                         results.append(item)
-                        if len(results) >= limit + 2:
+                        if len(results) >= limit + 3:
                             break
-            except Exception as e:
-                logger.warning(f"web_search fetch failed ({url[:40]}): {e}")
+    except Exception as e:
+        logger.warning(f"google news rss failed: {e}")
+
     if not results:
         return "No web search results found."
     lines = []
-    for i, item in enumerate(results[:limit + 2], 1):
+    for i, item in enumerate(results[:limit + 3], 1):
         meta = f" ({item['pub']})" if item["pub"] else ""
         snippet = f" — {item['desc']}" if item["desc"] else ""
         lines.append(f"{i}. {item['title']}{meta}\n   URL: {item['link']}{snippet}")
