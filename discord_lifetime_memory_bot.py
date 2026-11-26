@@ -1262,6 +1262,24 @@ async def _generate_via_gemini_api(prompt: str, aspect_ratio: str = "") -> Optio
     return None
 
 
+async def _generate_via_pollinations(client: httpx.AsyncClient, prompt: str,
+                                     aspect_ratio: str = "") -> Optional[bytes]:
+    """Free keyless image generation fallback when Gemini API / CDN are blocked."""
+    dims = {"16:9": (1280, 720), "9:16": (720, 1280), "4:3": (1024, 768), "3:4": (768, 1024)}
+    w, h = dims.get(aspect_ratio.strip(), (1024, 1024))
+    url = (
+        f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}"
+        f"?width={w}&height={h}&nologo=true"
+    )
+    try:
+        r = await client.get(url, follow_redirects=True, timeout=60)
+        if r.status_code == 200 and (r.headers.get("content-type") or "").startswith("image/") and r.content:
+            return r.content
+    except Exception as e:
+        logger.warning(f"Pollinations image fallback failed: {e}")
+    return None
+
+
 async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "") -> str:
     prompt = (prompt or "").strip()
     if not prompt:
@@ -1294,21 +1312,33 @@ async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "")
         except Exception as e:
             logger.warning(f"image b64_json failed: {e}")
 
-        # 3. Fallback: request URL and attempt direct fetch.
-        r2 = await client.post(IMAGE_GEN_URL, json={
-            "prompt": full_prompt,
-            "model": "gemini-auto",
-            "n": 1,
-            "response_format": "url",
-        })
-        r2.raise_for_status()
-        url = ((r2.json().get("data") or [{}])[0]).get("url") or ""
+        # 3. Fallback: request URL from gemini-web-to-api and attempt direct fetch.
+        url = ""
+        try:
+            r2 = await client.post(IMAGE_GEN_URL, json={
+                "prompt": full_prompt,
+                "model": "gemini-auto",
+                "n": 1,
+                "response_format": "url",
+            })
+            if r2.status_code == 200:
+                url = ((r2.json().get("data") or [{}])[0]).get("url") or ""
+                if url:
+                    raw = await _download_image_bytes(url)
+                    if raw:
+                        await channel.send(file=discord.File(io.BytesIO(raw), filename="image.png"))
+                        return f"Generated and sent image to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
+        except Exception as e:
+            logger.warning(f"image url fallback failed: {e}")
+
+        # 4. Final fallback: Pollinations (keyless direct JPEG, works when Gemini 429/CDN 403).
+        poly = await _generate_via_pollinations(client, prompt, aspect_ratio)
+        if poly:
+            await channel.send(file=discord.File(io.BytesIO(poly), filename="image.jpg"))
+            return f"Generated and sent image via Pollinations fallback to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
+
         if not url:
             return "ERROR: image generator returned no image"
-        raw = await _download_image_bytes(url)
-        if raw:
-            await channel.send(file=discord.File(io.BytesIO(raw), filename="image.png"))
-            return f"Generated and sent image to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
         hint = (
             " Set GEMINI_API_KEY in Railway to bypass the Google CDN 403."
             if not GEMINI_API_KEY else ""

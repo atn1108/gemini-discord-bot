@@ -898,19 +898,38 @@ async def image_gen_checks():
                 return FakeResp(500, {"error": "403"})
             return FakeResp(200, {"data": [{"url": "https://lh3.googleusercontent.com/gg-dl/test"}]})
 
+        async def get(self, url, **kw):
+            resp = FakeResp(200, {})
+            resp.headers = {"content-type": "image/jpeg"}
+            resp.content = b"\xff\xd8\xffFAKEJPG"
+            return resp
+
     async def no_dl(_url):
         return None
 
+    async def no_poly(_client, _prompt, _ar=""):
+        return None
+
     real_dl = bot_mod._download_image_bytes
+    real_poly = bot_mod._generate_via_pollinations
     bot_mod.httpx.AsyncClient = FakeClient403
     bot_mod._download_image_bytes = no_dl
     try:
+        # When Gemini CDN 403s, Pollinations fallback delivers a real image file.
+        sent_imgs.clear()
+        out_poly = await bot_mod._generate_and_send_image(ImgChan(), "cute cat", "16:9")
+        check("img: Pollinations fallback sends image on CDN 403",
+              "Pollinations" in out_poly and sent_imgs and sent_imgs[0][0] == "image.jpg", out_poly)
+
+        # If Pollinations also fails, report the 403 URL honestly.
+        bot_mod._generate_via_pollinations = no_poly
         out2 = await bot_mod._generate_and_send_image(ImgChan(), "cute cat")
         check("img: 403 CDN fallback reports URL honestly",
               "IMAGE_FETCH_BLOCKED" in out2 and "lh3.googleusercontent.com" in out2, out2)
     finally:
         bot_mod.httpx.AsyncClient = real_client
         bot_mod._download_image_bytes = real_dl
+        bot_mod._generate_via_pollinations = real_poly
 
 
 run_now(image_gen_checks())
