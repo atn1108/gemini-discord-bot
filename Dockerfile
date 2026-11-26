@@ -5,4 +5,5 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY discord_lifetime_memory_bot.py .
+COPY skills ./skills
 CMD ["python", "discord_lifetime_memory_bot.py"]

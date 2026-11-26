@@ -131,8 +131,10 @@ check("research: none", bot_mod.research_query("xin chào") is None)
 # ---------- 4. build_system_prompt ----------
 
 async def check_prompt():
+    real_skills = bot_mod.get_all_skills
     bot_mod.SYSTEM_PROMPT = "PERSONA"
     bot_mod.get_facts = _empty
+    bot_mod.get_all_skills = _empty
     p = await bot_mod.build_system_prompt()
     check("prompt: no facts -> persona only", p == "PERSONA", p[:60])
 
@@ -150,6 +152,7 @@ async def check_prompt():
     # order preserved (oldest first as get_facts returns them)
     check("prompt: fact order kept", p.index("tên anh") < p.index("Max thích"))
     bot_mod.get_facts = fake_get_facts
+    bot_mod.get_all_skills = real_skills
     bot_mod.SYSTEM_PROMPT = real_prompt
 
 

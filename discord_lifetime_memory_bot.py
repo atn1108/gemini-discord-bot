@@ -57,7 +57,10 @@ IMAGE_GEN_URL = os.getenv(
     "https://gemini-web-to-api-production.up.railway.app/openai/v1/images/generations",
 )
 IMAGE_GEN_TIMEOUT = int(os.getenv("IMAGE_GEN_TIMEOUT", "120"))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image").strip()
 GEMINI_COOKIES = os.getenv("GEMINI_COOKIES", "")
+SKILLS_DIR = os.getenv("SKILLS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills"))
 MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(5 * 1024 * 1024)))
 MAX_FILE_TEXT_CHARS = int(os.getenv("MAX_FILE_TEXT_CHARS", "12000"))
 MUSIC_QUEUE_MAX = int(os.getenv("MUSIC_QUEUE_MAX", "50"))
@@ -92,11 +95,12 @@ Xưng "em" hoặc "bé", gọi các thành viên theo tên hiển thị (nếu c
 - Code đặt trong block ```ngôn_ngữ ... ```.
 - Tối ưu độ dài: câu hỏi thường trả lời trong 1–4 câu; hướng dẫn kỹ thuật hoặc tổng hợp tin tức thì chia ý rõ ràng, đủ bước.
 
-# Tool Use (Công cụ server, nhạc, web, ảnh, tệp)
+# Tool Use (Công cụ server, nhạc, web, ảnh, tệp, skill)
 - Khi thành viên yêu cầu phát nhạc ("mở bài...", "bật nhạc...", "skip", "tạm dừng", "dừng nhạc", "xem hàng đợi"), gọi `play_music` hoặc `music_control`. Bé sẽ tự vào kênh voice của người gọi để phát.
 - Khi cần tra cứu web mới nhất hoặc đọc nội dung một link cụ thể, gọi `web_search` / `fetch_url`.
 - Khi thành viên nhờ vẽ/tạo ảnh, gọi `generate_image` (bé tự tạo và gửi ảnh thẳng lên kênh).
 - Khi thành viên nhờ tạo/xuất file (code, markdown, json, csv, txt...), gọi `send_file` để gửi tệp đính kèm thật lên Discord.
+- Khi cần dùng hoặc cài kỹ năng mở rộng, dùng `list_skills` / `read_skill` (hoặc `install_skill` / `remove_skill` nếu người gọi là admin).
 - Khi thành viên yêu cầu thao tác trên server (kick/ban/timeout, tạo/xóa kênh, đổi biệt danh, thêm/bỏ role), gọi tool tương ứng thay vì chỉ hứa làm.
 - Người được nhắc trong tin nhắn đã hiển thị dạng `@Tên(id)` — dùng đúng id đó làm tham số, không tự bịa id.
 - Tool quản trị chỉ chạy khi người yêu cầu là admin; nếu kết quả là DENIED thì báo thẳng người đó không đủ quyền, không thử lại hay lách.
@@ -149,6 +153,16 @@ async def init_db():
                 username TEXT NOT NULL DEFAULT '',
                 commands JSONB NOT NULL DEFAULT '[]',
                 last_seen TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_skills (
+                name TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                instructions TEXT NOT NULL DEFAULT '',
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                author TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
     logger.info("Database initialized")
@@ -393,12 +407,210 @@ def render_channels() -> str:
     return "\n".join(out)
 
 
+# ===== SKILL SYSTEM (disk SKILL.md / tool.py + Postgres bot_skills) =====
+DISK_SKILLS: Dict[str, Dict[str, Any]] = {}
+SKILL_HANDLERS: Dict[str, Any] = {}
+SKILL_INLINE_BUDGET = 2500
+
+
+def _clean_skill_name(name: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9_-]+", "-", (name or "").strip().lower()).strip("-_")
+    return cleaned[:64]
+
+
+def parse_skill_md(raw: str, fallback_name: str = "") -> Dict[str, Any]:
+    """Parse YAML-frontmatter SKILL.md text into a normalized skill dict."""
+    text = (raw or "").strip()
+    meta: Dict[str, Any] = {}
+    body = text
+    m = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", text, flags=re.S)
+    if m:
+        for line in m.group(1).splitlines():
+            if ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            k = k.strip().lower()
+            v = v.strip().strip('"').strip("'")
+            if v.lower() in ("true", "yes", "on"):
+                meta[k] = True
+            elif v.lower() in ("false", "no", "off"):
+                meta[k] = False
+            else:
+                meta[k] = v
+        body = m.group(2).strip()
+    name = _clean_skill_name(str(meta.get("name") or fallback_name))
+    desc = str(meta.get("description") or "").strip()[:300]
+    if not desc and body:
+        first_line = next((ln.lstrip("# ").strip() for ln in body.splitlines() if ln.strip()), "")
+        desc = first_line[:200]
+    return {
+        "name": name,
+        "description": desc,
+        "instructions": body[:MAX_FILE_TEXT_CHARS],
+        "always_on": bool(meta.get("always_on", False)),
+        "enabled": bool(meta.get("enabled", True)),
+    }
+
+
+def load_disk_skills(skills_dir: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Load skills/<name>/SKILL.md (and optional tool.py) from disk."""
+    import importlib.util
+
+    root = skills_dir or SKILLS_DIR
+    DISK_SKILLS.clear()
+    SKILL_HANDLERS.clear()
+    if not os.path.isdir(root):
+        return DISK_SKILLS
+
+    for entry in sorted(os.listdir(root)):
+        subdir = os.path.join(root, entry)
+        skill_md = os.path.join(subdir, "SKILL.md")
+        if not (os.path.isdir(subdir) and os.path.isfile(skill_md)):
+            continue
+        try:
+            raw = open(skill_md, encoding="utf-8").read()
+            parsed = parse_skill_md(raw, fallback_name=entry)
+            if not parsed["name"]:
+                continue
+            parsed["source"] = "disk"
+            parsed["author"] = "repo"
+            DISK_SKILLS[parsed["name"]] = parsed
+
+            tool_py = os.path.join(subdir, "tool.py")
+            if os.path.isfile(tool_py):
+                spec = importlib.util.spec_from_file_location(f"skill_{parsed['name']}", tool_py)
+                if spec and spec.loader:
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    schema = getattr(mod, "TOOL_SCHEMA", None)
+                    runner = getattr(mod, "run", None)
+                    if isinstance(schema, dict) and callable(runner):
+                        tname = (schema.get("function") or {}).get("name")
+                        if tname:
+                            SKILL_HANDLERS[tname] = runner
+                            if not any((t.get("function") or {}).get("name") == tname for t in TOOLS):
+                                TOOLS.append(schema)
+                            if getattr(mod, "ADMIN_ONLY", False):
+                                DANGEROUS_TOOLS.add(tname)
+        except Exception as e:
+            logger.warning(f"failed loading skill {entry}: {e}")
+    return DISK_SKILLS
+
+
+async def get_all_skills() -> List[Dict[str, Any]]:
+    """Return disk skills merged with DB-installed skills (DB overrides enabled/content)."""
+    merged = {k: dict(v) for k, v in DISK_SKILLS.items()}
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT name, description, instructions, enabled, author "
+                    "FROM bot_skills ORDER BY name ASC"
+                )
+            for r in rows:
+                name = _clean_skill_name(r["name"])
+                if not name:
+                    continue
+                base = merged.get(name, {})
+                merged[name] = {
+                    "name": name,
+                    "description": r["description"] or base.get("description", ""),
+                    "instructions": r["instructions"] or base.get("instructions", ""),
+                    "enabled": bool(r["enabled"]),
+                    "always_on": base.get("always_on", False),
+                    "source": "db" if name not in merged else "disk+db",
+                    "author": r["author"] or base.get("author", ""),
+                }
+        except Exception as e:
+            logger.warning(f"get_all_skills DB read failed: {e}")
+    return [merged[k] for k in sorted(merged)]
+
+
+async def upsert_skill(name: str, description: str, instructions: str,
+                       author: str = "", enabled: bool = True) -> Dict[str, Any]:
+    clean = _clean_skill_name(name)
+    if not clean:
+        raise ValueError("Invalid skill name (use letters, digits, '-' or '_')")
+    desc = (description or "").strip()[:300]
+    body = (instructions or "").strip()[:MAX_FILE_TEXT_CHARS]
+    if not body:
+        raise ValueError("Skill instructions cannot be empty")
+    if pool is not None:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO bot_skills (name, description, instructions, enabled, author, updated_at)
+                VALUES ($1, $2, $3, $4, $5, NOW())
+                ON CONFLICT (name) DO UPDATE SET
+                    description = EXCLUDED.description,
+                    instructions = EXCLUDED.instructions,
+                    enabled = EXCLUDED.enabled,
+                    author = EXCLUDED.author,
+                    updated_at = NOW()
+                """,
+                clean, desc, body, enabled, (author or "")[:100],
+            )
+    return {"name": clean, "description": desc, "instructions": body, "enabled": enabled}
+
+
+async def set_skill_enabled(name: str, enabled: bool) -> bool:
+    clean = _clean_skill_name(name)
+    if not clean:
+        return False
+    disk = DISK_SKILLS.get(clean)
+    if pool is not None:
+        async with pool.acquire() as conn:
+            res = await conn.execute(
+                "UPDATE bot_skills SET enabled = $2, updated_at = NOW() WHERE name = $1",
+                clean, enabled,
+            )
+            if res.endswith("1"):
+                return True
+            if disk is not None:
+                await upsert_skill(clean, disk["description"], disk["instructions"], "repo", enabled)
+                return True
+    elif disk is not None:
+        disk["enabled"] = enabled
+        return True
+    return False
+
+
+async def delete_skill(name: str) -> bool:
+    clean = _clean_skill_name(name)
+    if not clean or pool is None:
+        return False
+    async with pool.acquire() as conn:
+        res = await conn.execute("DELETE FROM bot_skills WHERE name = $1", clean)
+    return res.endswith("1")
+
+
+def render_skills(skills: List[Dict[str, Any]]) -> str:
+    """Format enabled skills into a prompt section with progressive disclosure."""
+    active = [s for s in skills if s.get("enabled", True)]
+    if not active:
+        return ""
+    total_chars = sum(len(s.get("instructions") or "") for s in active)
+    inline_all = total_chars <= SKILL_INLINE_BUDGET
+    lines = [
+        "# Installed Skills (kỹ năng đã cài cho Bé Yêu)",
+        "Khi yêu cầu khớp với skill bên dưới, làm theo đúng hướng dẫn của skill đó. "
+        "Nếu skill chưa hiện nội dung chi tiết, gọi `read_skill(name)` trước khi thực hiện.",
+    ]
+    for s in active:
+        desc = f": {s['description']}" if s.get("description") else ""
+        lines.append(f"- **{s['name']}**{desc}")
+        if (inline_all or s.get("always_on")) and s.get("instructions"):
+            lines.append(s["instructions"])
+    return "\n\n".join(lines)
+
+
 async def build_system_prompt() -> str:
-    """Persona + remembered facts + peer bots + channels + live date."""
+    """Persona + remembered facts + peer bots + channels + skills + live date."""
     facts = await get_facts()
     bots = await get_peer_bots()
     channels = render_channels()
-    if not facts and not bots and not channels:
+    skills = await get_all_skills()
+    if not facts and not bots and not channels and not skills:
         return SYSTEM_PROMPT
     parts = [SYSTEM_PROMPT]
     now_vn = datetime.datetime.now(
@@ -424,6 +636,9 @@ async def build_system_prompt() -> str:
         parts.append(render_peer_bots(bots))
     if channels:
         parts.append(channels)
+    rendered_skills = render_skills(skills)
+    if rendered_skills:
+        parts.append(rendered_skills)
     return "\n\n".join(parts)
 
 async def persist_turn(channel_id: int, history: List[Dict], answer: str) -> None:
@@ -565,11 +780,39 @@ TOOLS: List[Dict] = [
             "caption": {"type": "string", "description": "Optional short message sent with the file"},
             "channel_id": {"type": "string", "description": "Optional target text channel ID (defaults to current channel)"}},
             "required": ["filename", "content"]}}},
+    # Skill management (list/read safe for everyone; install/remove admin-only).
+    {"type": "function", "function": {
+        "name": "list_skills",
+        "description": "List all installed skills (disk and database) with status and description.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "read_skill",
+        "description": "Read the full instructions of an installed skill by name.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Skill name"}},
+            "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "install_skill",
+        "description": "Install or update a markdown skill for the bot (persisted in database). Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Short lowercase slug, e.g. code-review, summarize-chat"},
+            "description": {"type": "string", "description": "One-line description of when to use the skill"},
+            "instructions": {"type": "string", "description": "Full Markdown instructions (or full SKILL.md content)"}},
+            "required": ["name", "instructions"]}}},
+    {"type": "function", "function": {
+        "name": "remove_skill",
+        "description": "Uninstall a database skill (or disable a built-in disk skill). Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Skill name to remove/disable"}},
+            "required": ["name"]}}},
 ]
 
 # Tools that require admin rights.
 DANGEROUS_TOOLS = {"kick", "ban", "timeout", "create_channel", "delete_channel",
-                   "set_nickname", "add_role", "remove_role"}
+                   "set_nickname", "add_role", "remove_role",
+                   "install_skill", "remove_skill"}
+
+load_disk_skills()
 
 
 # ===== MUSIC PLAYER (per-guild voice queue) =====
@@ -975,13 +1218,65 @@ async def _download_image_bytes(url: str) -> Optional[bytes]:
     return None
 
 
+async def _generate_via_gemini_api(prompt: str, aspect_ratio: str = "") -> Optional[tuple[bytes, str]]:
+    """Generate image bytes directly via official Google AI Studio Gemini API."""
+    if not GEMINI_API_KEY:
+        return None
+    models_to_try = [GEMINI_IMAGE_MODEL]
+    for fallback_m in ("gemini-2.5-flash-image", "gemini-2.0-flash-exp-image-generation"):
+        if fallback_m not in models_to_try:
+            models_to_try.append(fallback_m)
+
+    ar = aspect_ratio.strip()
+    valid_ratios = {"1:1", "3:4", "4:3", "9:16", "16:9"}
+    async with httpx.AsyncClient(timeout=IMAGE_GEN_TIMEOUT) as client:
+        for model in models_to_try:
+            gen_cfg: Dict[str, Any] = {"responseModalities": ["TEXT", "IMAGE"]}
+            if ar in valid_ratios and "2.0-flash-exp" not in model:
+                gen_cfg["imageConfig"] = {"aspectRatio": ar}
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            try:
+                r = await client.post(
+                    url,
+                    headers={"x-goog-api-key": GEMINI_API_KEY},
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": gen_cfg,
+                    },
+                )
+                if r.status_code == 404:
+                    continue
+                if r.status_code != 200:
+                    logger.warning(f"Gemini API image ({model}) HTTP {r.status_code}: {r.text[:200]}")
+                    continue
+                data = r.json()
+                for cand in data.get("candidates") or []:
+                    for part in (cand.get("content") or {}).get("parts") or []:
+                        inline = part.get("inlineData") or part.get("inline_data")
+                        if inline and inline.get("data"):
+                            mime = (inline.get("mimeType") or inline.get("mime_type") or "image/png").lower()
+                            ext = ".jpg" if "jpeg" in mime or "jpg" in mime else (".webp" if "webp" in mime else ".png")
+                            return base64.b64decode(inline["data"]), ext
+            except Exception as e:
+                logger.warning(f"Gemini API image ({model}) failed: {e}")
+    return None
+
+
 async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "") -> str:
     prompt = (prompt or "").strip()
     if not prompt:
         return "ERROR: empty image prompt"
+
+    # 1. Official Gemini API (returns direct inline image bytes, immune to CDN 403).
+    api_img = await _generate_via_gemini_api(prompt, aspect_ratio)
+    if api_img is not None:
+        raw, ext = api_img
+        await channel.send(file=discord.File(io.BytesIO(raw), filename=f"image{ext}"))
+        return f"Generated and sent image via Gemini API to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
+
     full_prompt = f"{prompt} (aspect ratio {aspect_ratio.strip()})" if aspect_ratio.strip() else prompt
     async with httpx.AsyncClient(timeout=IMAGE_GEN_TIMEOUT) as client:
-        # First try b64_json so the upstream service handles Google cookies.
+        # 2. Fallback: gemini-web-to-api b64_json.
         try:
             r = await client.post(IMAGE_GEN_URL, json={
                 "prompt": full_prompt,
@@ -999,7 +1294,7 @@ async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "")
         except Exception as e:
             logger.warning(f"image b64_json failed: {e}")
 
-        # Fallback: request URL and attempt direct fetch.
+        # 3. Fallback: request URL and attempt direct fetch.
         r2 = await client.post(IMAGE_GEN_URL, json={
             "prompt": full_prompt,
             "model": "gemini-auto",
@@ -1014,8 +1309,12 @@ async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "")
         if raw:
             await channel.send(file=discord.File(io.BytesIO(raw), filename="image.png"))
             return f"Generated and sent image to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
+        hint = (
+            " Set GEMINI_API_KEY in Railway to bypass the Google CDN 403."
+            if not GEMINI_API_KEY else ""
+        )
         return (f"IMAGE_FETCH_BLOCKED: Gemini generated the image at {url} "
-                f"but Google CDN returned HTTP 403 when fetching the file bytes directly. "
+                f"but Google CDN returned HTTP 403 when fetching the file bytes directly.{hint} "
                 f"Share this link with the user and explain the 403 CDN limitation.")
 
 
@@ -1299,6 +1598,49 @@ async def execute_tool(name: str, args: Dict, guild: discord.Guild,
 
         if name == "send_file":
             return await _handle_send_file(guild, channel, args)
+
+        if name == "list_skills":
+            skills = await get_all_skills()
+            if not skills:
+                return "No skills installed yet."
+            return "\n".join(
+                f"- {s['name']} [{'on' if s['enabled'] else 'off'}, {s['source']}]: {s['description']}"
+                for s in skills
+            )
+
+        if name == "read_skill":
+            target_name = _clean_skill_name(args.get("name") or "")
+            for s in await get_all_skills():
+                if s["name"] == target_name:
+                    return f"# Skill: {s['name']}\n{s['instructions']}"
+            return f"ERROR: skill '{args.get('name')}' not found"
+
+        if name == "install_skill":
+            raw_inst = args.get("instructions") or ""
+            parsed = parse_skill_md(raw_inst, fallback_name=args.get("name") or "")
+            saved = await upsert_skill(
+                args.get("name") or parsed["name"],
+                args.get("description") or parsed["description"],
+                parsed["instructions"] or raw_inst,
+                author=getattr(caller, "display_name", "") or "admin",
+            )
+            return f"Installed skill '{saved['name']}': {saved['description']}"
+
+        if name == "remove_skill":
+            target_name = _clean_skill_name(args.get("name") or "")
+            if await delete_skill(target_name):
+                return f"Removed skill '{target_name}'."
+            if await set_skill_enabled(target_name, False):
+                return f"Disabled built-in skill '{target_name}'."
+            return f"ERROR: skill '{args.get('name')}' not found"
+
+        if name in SKILL_HANDLERS:
+            handler = SKILL_HANDLERS[name]
+            ctx = {"guild": guild, "channel": channel, "caller": caller, "admin": admin}
+            res = handler(args, ctx)
+            if asyncio.iscoroutine(res):
+                res = await res
+            return str(res)
 
         return f"ERROR: unknown tool '{name}'"
     except Exception as e:
@@ -1824,6 +2166,58 @@ async def research(
         return await ctx.followup.send(text, wait=True)
 
     await deliver_research(_send, query, max_sources)
+
+@bot.slash_command(name="skills", description="Danh sách các skill đã cài cho Bé Yêu")
+async def skills_cmd(ctx):
+    rows = await get_all_skills()
+    if not rows:
+        await ctx.respond("🧩 Chưa có skill nào được cài. Admin có thể dùng `/skill_install`.")
+        return
+    lines = [
+        f"- `{s['name']}` ({'bật' if s['enabled'] else 'tắt'} · {s['source']})"
+        + (f" — {s['description']}" if s.get("description") else "")
+        for s in rows
+    ]
+    out = "**🧩 Installed Skills:**\n" + "\n".join(lines)
+    await ctx.respond(out[:1900])
+
+@bot.slash_command(name="skill_install", description="[Admin] Cài hoặc cập nhật một skill cho Bé Yêu")
+async def skill_install_cmd(ctx, name: str, description: str, instructions: str):
+    if not await is_admin(ctx.author, ctx.guild):
+        await ctx.respond("🚫 Chỉ admin mới được cài skill.", ephemeral=True)
+        return
+    try:
+        parsed = parse_skill_md(instructions, fallback_name=name)
+        saved = await upsert_skill(
+            name or parsed["name"],
+            description or parsed["description"],
+            parsed["instructions"] or instructions,
+            author=getattr(ctx.author, "display_name", ""),
+        )
+        await ctx.respond(f"✅ Đã cài skill **`{saved['name']}`** ({saved['description'] or 'không có mô tả'}).")
+    except ValueError as e:
+        await ctx.respond(f"❌ {e}", ephemeral=True)
+
+@bot.slash_command(name="skill_toggle", description="[Admin] Bật hoặc tắt một skill")
+async def skill_toggle_cmd(ctx, name: str, enabled: bool):
+    if not await is_admin(ctx.author, ctx.guild):
+        await ctx.respond("🚫 Chỉ admin mới được bật/tắt skill.", ephemeral=True)
+        return
+    ok = await set_skill_enabled(name, enabled)
+    if ok:
+        await ctx.respond(f"✅ Skill **`{_clean_skill_name(name)}`** đã {'bật' if enabled else 'tắt'}.")
+    else:
+        await ctx.respond(f"❌ Không tìm thấy skill `{name}`.", ephemeral=True)
+
+@bot.slash_command(name="skill_remove", description="[Admin] Xóa một skill đã cài trong database")
+async def skill_remove_cmd(ctx, name: str):
+    if not await is_admin(ctx.author, ctx.guild):
+        await ctx.respond("🚫 Chỉ admin mới được xóa skill.", ephemeral=True)
+        return
+    if await delete_skill(name):
+        await ctx.respond(f"🗑️ Đã xóa skill **`{_clean_skill_name(name)}`**.")
+    else:
+        await ctx.respond(f"❌ Không tìm thấy skill `{name}` trong database.", ephemeral=True)
 
 # ===== STARTUP =====
 @bot.listen()

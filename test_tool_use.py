@@ -509,6 +509,7 @@ check("render: tells the model not to invent bots",
 # prompt wiring: persona + facts + peer bots in one build
 async def prompt_check():
     real_facts, real_bots = bot_mod.get_facts, bot_mod.get_peer_bots
+    real_skills = bot_mod.get_all_skills
     real_prompt = bot_mod.SYSTEM_PROMPT
     bot_mod.SYSTEM_PROMPT = "PERSONA"
 
@@ -518,10 +519,13 @@ async def prompt_check():
     async def no_bots():
         return []
 
+    async def no_skills():
+        return []
+
     async def some_bots():
         return [{"bot_id": 1, "username": "Dyno", "commands": ["dadjoke"]}]
 
-    bot_mod.get_facts, bot_mod.get_peer_bots = no_facts, no_bots
+    bot_mod.get_facts, bot_mod.get_peer_bots, bot_mod.get_all_skills = no_facts, no_bots, no_skills
     p = await bot_mod.build_system_prompt()
     check("prompt: nothing to add -> persona untouched", p == "PERSONA", p[:60])
 
@@ -531,7 +535,7 @@ async def prompt_check():
     check("prompt: persona still first", p.startswith("PERSONA"))
     check("prompt: learned command reaches the model", "`/dadjoke`" in p)
 
-    bot_mod.get_facts, bot_mod.get_peer_bots = real_facts, real_bots
+    bot_mod.get_facts, bot_mod.get_peer_bots, bot_mod.get_all_skills = real_facts, real_bots, real_skills
     bot_mod.SYSTEM_PROMPT = real_prompt
 
 
@@ -944,6 +948,148 @@ async def attachment_checks():
 
 
 run_now(attachment_checks())
+
+# ---------- 8. Gemini API image generation + skill system ----------
+
+async def gemini_api_image_check():
+    import base64
+    sent = []
+
+    class ApiChan:
+        id = 888
+        name = "gemini-art"
+
+        async def send(self, content=None, file=None):
+            sent.append((file.filename, file.fp.read()))
+
+    class FakeResp:
+        def __init__(self, code, data):
+            self.status_code = code
+            self._data = data
+            self.text = json.dumps(data)
+
+        def json(self):
+            return self._data
+
+    png_bytes = b"\x89PNG\r\n\x1a\nGEMINI_API"
+    seen_headers = []
+
+    class FakeApiClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            seen_headers.append((url, headers))
+            return FakeResp(200, {
+                "candidates": [{
+                    "content": {
+                        "parts": [
+                            {"text": "ok"},
+                            {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(png_bytes).decode()}},
+                        ]
+                    }
+                }]
+            })
+
+    real_key = bot_mod.GEMINI_API_KEY
+    real_client = bot_mod.httpx.AsyncClient
+    bot_mod.GEMINI_API_KEY = "test-api-key"
+    bot_mod.httpx.AsyncClient = FakeApiClient
+    try:
+        out = await bot_mod._generate_and_send_image(ApiChan(), "cyberpunk cat", "16:9")
+        check("gemini api img: sends decoded bytes to Discord",
+              "Gemini API" in out and sent and sent[0][0] == "image.png" and sent[0][1] == png_bytes, out)
+        check("gemini api img: sends key in x-goog-api-key header (not URL)",
+              seen_headers and "key=" not in seen_headers[0][0]
+              and seen_headers[0][1].get("x-goog-api-key") == "test-api-key")
+    finally:
+        bot_mod.GEMINI_API_KEY = real_key
+        bot_mod.httpx.AsyncClient = real_client
+
+
+run_now(gemini_api_image_check())
+
+# 8b. Skill parser, disk loader, prompt rendering, and admin gating
+parsed_skill = bot_mod.parse_skill_md(
+    "---\nname: My Cool Skill!\ndescription: Helps test\nalways_on: true\n---\nStep 1: Do X\n"
+)
+check("skill parse: normalizes name and frontmatter",
+      parsed_skill["name"] == "my-cool-skill"
+      and parsed_skill["description"] == "Helps test"
+      and parsed_skill["always_on"] is True
+      and "Step 1: Do X" in parsed_skill["instructions"], str(parsed_skill))
+
+check("skill disk: starter summarize-chat skill loaded",
+      "summarize-chat" in bot_mod.DISK_SKILLS, str(list(bot_mod.DISK_SKILLS)))
+
+
+async def skill_tool_checks():
+    import tempfile, shutil
+    # Non-admin cannot install or remove skills
+    denied = await bot_mod.execute_tool("install_skill", {
+        "name": "evil", "description": "x", "instructions": "y"
+    }, None, None, None, False)
+    check("skill: non-admin install_skill DENIED", "DENIED" in denied, denied)
+
+    denied_rm = await bot_mod.execute_tool("remove_skill", {"name": "summarize-chat"}, None, None, None, False)
+    check("skill: non-admin remove_skill DENIED", "DENIED" in denied_rm, denied_rm)
+
+    # Admin can install (in-memory/no-pool check validates args cleanly) and read starter skill
+    lst = await bot_mod.execute_tool("list_skills", {}, None, None, None, False)
+    check("skill: list_skills shows summarize-chat", "summarize-chat" in lst, lst)
+
+    rd = await bot_mod.execute_tool("read_skill", {"name": "summarize-chat"}, None, None, None, False)
+    check("skill: read_skill returns full instructions", "read_channel" in rd, rd[:120])
+
+    # Progressive disclosure: large skill instructions switch to read_skill catalog mode
+    rendered_small = bot_mod.render_skills([
+        {"name": "s1", "description": "d1", "instructions": "short", "enabled": True, "always_on": False}
+    ])
+    check("skill render: small skills inline instructions", "short" in rendered_small)
+    rendered_large = bot_mod.render_skills([
+        {"name": "s1", "description": "d1", "instructions": "A" * 3000, "enabled": True, "always_on": False},
+        {"name": "s2", "description": "d2", "instructions": "ALWAYS", "enabled": True, "always_on": True},
+    ])
+    check("skill render: large skills use progressive disclosure + always_on",
+          "read_skill(name)" in rendered_large and ("A" * 100) not in rendered_large and "ALWAYS" in rendered_large)
+
+    # Disk tool.py skill loading + execution
+    tmp = tempfile.mkdtemp()
+    real_tools = list(bot_mod.TOOLS)
+    real_handlers = dict(bot_mod.SKILL_HANDLERS)
+    real_disk = dict(bot_mod.DISK_SKILLS)
+    try:
+        sdir = os.path.join(tmp, "ping-skill")
+        os.makedirs(sdir)
+        with open(os.path.join(sdir, "SKILL.md"), "w", encoding="utf-8") as f:
+            f.write("---\nname: ping-skill\ndescription: ping test\n---\nUse ping_tool.")
+        with open(os.path.join(sdir, "tool.py"), "w", encoding="utf-8") as f:
+            f.write(
+                'TOOL_SCHEMA = {"type": "function", "function": {"name": "ping_tool", "description": "p", "parameters": {"type": "object", "properties": {}}}}\n'
+                'async def run(args, ctx):\n'
+                '    return "PONG!"\n'
+            )
+        bot_mod.load_disk_skills(tmp)
+        check("skill tool.py: registered into TOOLS and SKILL_HANDLERS",
+              "ping_tool" in bot_mod.SKILL_HANDLERS and any(t["function"]["name"] == "ping_tool" for t in bot_mod.TOOLS))
+        got = await bot_mod.execute_tool("ping_tool", {}, None, None, None, False)
+        check("skill tool.py: executes handler", got == "PONG!", got)
+    finally:
+        bot_mod.TOOLS[:] = real_tools
+        bot_mod.SKILL_HANDLERS.clear()
+        bot_mod.SKILL_HANDLERS.update(real_handlers)
+        bot_mod.DISK_SKILLS.clear()
+        bot_mod.DISK_SKILLS.update(real_disk)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+run_now(skill_tool_checks())
 
 print()
 if failures:
