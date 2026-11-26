@@ -537,6 +537,63 @@ async def prompt_check():
 
 run_now(prompt_check())
 
+# ---------- 5d. channel directory (real ids, discovered from the guild) ----------
+
+check("chan: no guilds -> no section", bot_mod.render_channels() == "")
+
+
+class Chan:
+    def __init__(self, cid, name, kind):
+        self.id, self.name, self.type = cid, name, kind
+
+
+class Guild:
+    def __init__(self, channels):
+        self.channels = channels
+
+
+real_bot = bot_mod.bot
+try:
+    bot_mod.bot = type("BotStub", (), {"guilds": [Guild([
+        Chan(1532004555422699611, "chat-chung", "text"),
+        Chan(1532053318556319764, "bot-tool", "text"),
+        Chan(1532397250364309617, "General VC", "voice"),
+        Chan(1, "", "text"),          # no name -> skipped
+    ])]})()
+    sec = bot_mod.render_channels()
+    check("chan: text channel listed with its real id",
+          "#chat-chung (1532004555422699611)" in sec, sec[:120])
+    check("chan: second text channel too",
+          "#bot-tool (1532053318556319764)" in sec)
+    check("chan: voice channel flagged as no-text",
+          "General VC" in sec and "KHÔNG" in sec and "join voice" in sec)
+    check("chan: unnamed channel skipped", "id 1" not in sec and "(1)" not in sec)
+    check("chan: mentions read/send tools",
+          "read_channel" in sec and "send_to_channel" in sec)
+
+    # a text-only guild omits the voice line entirely
+    bot_mod.bot = type("BotStub", (), {"guilds": [Guild([Chan(9, "meme", "text")])]})()
+    check("chan: no voice channel -> no voice warning",
+          "KHÔNG" not in bot_mod.render_channels())
+finally:
+    bot_mod.bot = real_bot
+
+# voice channel rejects both tools instead of crashing
+async def voice_tools():
+    guild = Guild([Chan(77, "lobby", "voice")])
+    guild.get_channel = lambda cid: next(
+        (c for c in guild.channels if c.id == cid), None)
+    got = await bot_mod.execute_tool("send_to_channel",
+                                     {"channel_id": "77", "content": "hi"},
+                                     guild, None, None, False)
+    check("chan: send to voice refused", "ERROR" in got and "voice" in got, got)
+    got = await bot_mod.execute_tool("read_channel", {"channel_id": "77"},
+                                     guild, None, None, False)
+    check("chan: read from voice refused", "ERROR" in got and "voice" in got, got)
+
+
+run_now(voice_tools())
+
 # ---------- 6. schema sanity ----------
 
 names = [t["function"]["name"] for t in bot_mod.TOOLS]

@@ -343,11 +343,43 @@ def render_peer_bots(bots: List[Dict]) -> str:
     )
 
 
+def render_channels() -> str:
+    """Prompt section listing this server's real channel ids.
+
+    The model needs actual ids for read_channel / send_to_channel, and the
+    list comes from the live guild so a renamed or newly created channel is
+    never stale. Voice channels are called out because they take no text.
+    """
+    text, voice = [], []
+    for guild in getattr(bot, "guilds", None) or []:
+        for ch in getattr(guild, "channels", None) or []:
+            cid = getattr(ch, "id", None)
+            name = getattr(ch, "name", None)
+            if not cid or not name:
+                continue
+            kind = str(getattr(ch, "type", "") or "")
+            if "voice" in kind or "stage" in kind:
+                voice.append(f"#{name} ({cid})")
+            elif "text" in kind or "news" in kind or "forum" in kind:
+                text.append(f"#{name} ({cid})")
+    if not text and not voice:
+        return ""
+    out = ["# Kênh trong server (id thật, dùng cho read_channel / send_to_channel)",
+           "Chỉ kênh text nhận được tin nhắn."]
+    out += [f"- {t}" for t in text]
+    if voice:
+        out.append("Kênh voice/stage — bot không tự join voice và KHÔNG gửi text "
+                   "vào đây; nếu gọi bot nhạc đòi người gọi phải ở trong voice "
+                   "thì báo rõ giới hạn này: " + ", ".join(voice))
+    return "\n".join(out)
+
+
 async def build_system_prompt() -> str:
     """Persona + remembered facts + the peer bots discovered in this server."""
     facts = await get_facts()
     bots = await get_peer_bots()
-    if not facts and not bots:
+    channels = render_channels()
+    if not facts and not bots and not channels:
         return SYSTEM_PROMPT
     parts = [SYSTEM_PROMPT]
     if facts:
@@ -361,6 +393,8 @@ async def build_system_prompt() -> str:
         )
     if bots:
         parts.append(render_peer_bots(bots))
+    if channels:
+        parts.append(channels)
     return "\n\n".join(parts)
 
 async def persist_turn(channel_id: int, history: List[Dict], answer: str) -> None:
@@ -578,6 +612,9 @@ async def execute_tool(name: str, args: Dict, guild: discord.Guild,
             target = guild.get_channel(int(args.get("channel_id") or 0))
             if target is None:
                 return f"ERROR: channel not found"
+            if not hasattr(target, "history"):
+                return (f"ERROR: #{getattr(target, 'name', target.id)} is a "
+                        f"voice/stage channel and holds no text messages")
             limit = max(1, min(int(args.get("limit") or 5), 20))
             lines = []
             async for m in target.history(limit=limit):
@@ -589,6 +626,9 @@ async def execute_tool(name: str, args: Dict, guild: discord.Guild,
             target = guild.get_channel(int(args.get("channel_id") or 0))
             if target is None:
                 return f"ERROR: channel not found"
+            if not hasattr(target, "send"):
+                return (f"ERROR: #{getattr(target, 'name', target.id)} is a "
+                        f"voice/stage channel and cannot receive text")
             content = (args.get("content") or "")[:1900]
             await target.send(content)
             return f"Sent to channel {target.id}"
