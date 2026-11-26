@@ -121,6 +121,17 @@ async def init_db():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
+        # Peer bots discovered from the guild itself: which bots are present and
+        # which slash commands they have been seen serving. Learned, never
+        # hardcoded -- a bot added tomorrow shows up on the next refresh.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_bots (
+                bot_id BIGINT PRIMARY KEY,
+                username TEXT NOT NULL DEFAULT '',
+                commands JSONB NOT NULL DEFAULT '[]',
+                last_seen TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
     logger.info("Database initialized")
 
 def decode_messages(raw) -> List[Dict]:
@@ -198,21 +209,159 @@ async def delete_facts(pattern: str) -> int:
     parts = status.split()
     return int(parts[-1]) if len(parts) == 2 and parts[-1].isdigit() else 0
 
-async def build_system_prompt() -> str:
-    """The persona prompt, with the remembered facts appended when there are any."""
-    facts = await get_facts()
-    if not facts:
-        return SYSTEM_PROMPT
-    lines = "\n".join(
-        f"- {f['fact']} (do {f['author']} nhờ nhớ)" if f["author"] else f"- {f['fact']}"
-        for f in facts
-    )
+# ===== PEER BOTS (discovered, never hardcoded) =====
+# The roster comes from the guild itself, so a bot invited tomorrow shows up
+# without a code change. Slash commands are learned from the interaction
+# metadata on messages that answer them -- real usage, not a web page.
+PEER_BOT_LIMIT = 40      # how many peer bots ride along in the prompt
+PEER_CMD_LIMIT = 12      # how many commands per bot
+
+
+def _as_json(value, default):
+    """asyncpg hands jsonb back as str; accept parsed values too."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return default
+    return value if value is not None else default
+
+
+async def get_peer_bots() -> List[Dict]:
+    """Peer bots seen in this server, most recently used first.
+
+    Returns [] before the DB is up rather than raising: the prompt must still
+    build during startup and in tests that never call init_db.
+    """
+    if pool is None:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT bot_id, username, commands FROM peer_bots "
+            "ORDER BY last_seen DESC LIMIT $1", PEER_BOT_LIMIT)
+    out = []
+    for r in rows:
+        cmds = _as_json(r["commands"], [])
+        out.append({
+            "bot_id": r["bot_id"],
+            "username": r["username"],
+            "commands": [c for c in cmds if isinstance(c, str)][:PEER_CMD_LIMIT],
+        })
+    return out
+
+
+async def record_peer_bot(bot_id: int, username: str, command: str = "") -> None:
+    """Upsert one peer bot, merging in a newly learned command.
+
+    Never raises: discovering a bot must not be able to break message handling.
+    """
+    if pool is None:
+        return
+    username = (username or "")[:100]
+    command = (command or "")[:64]
+    try:
+        async with pool.acquire() as conn:
+            if command:
+                await conn.execute(
+                    """
+                    INSERT INTO peer_bots (bot_id, username, commands, last_seen)
+                    VALUES ($1, $2, $3::jsonb, NOW())
+                    ON CONFLICT (bot_id) DO UPDATE SET
+                        username = EXCLUDED.username,
+                        commands = (
+                            SELECT jsonb_agg(DISTINCT c)
+                            FROM jsonb_array_elements(
+                                COALESCE(peer_bots.commands, '[]'::jsonb)
+                                || EXCLUDED.commands
+                            ) AS t(c)
+                        ),
+                        last_seen = NOW()
+                    """,
+                    bot_id, username, json.dumps([command]),
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO peer_bots (bot_id, username, commands, last_seen)
+                    VALUES ($1, $2, '[]'::jsonb, NOW())
+                    ON CONFLICT (bot_id) DO UPDATE SET
+                        username = EXCLUDED.username, last_seen = NOW()
+                    """,
+                    bot_id, username,
+                )
+    except Exception as e:
+        logger.warning(f"record_peer_bot({bot_id}) failed: {e}")
+
+
+def learn_from_message(message) -> None:
+    """Notice a peer bot from a message it sent, and any command it served.
+
+    Fires on every message, so a newly invited bot is picked up the first time
+    it says anything -- no privileged intent, no hardcoded list.
+    """
+    author = getattr(message, "author", None)
+    if author is None or not getattr(author, "bot", False):
+        return
+    uid = getattr(author, "id", None)
+    if not uid or (bot.user is not None and uid == bot.user.id):
+        return  # never list ourselves
+    name = (getattr(author, "display_name", None)
+            or getattr(author, "name", None) or "")
+    if not name:
+        return  # nothing to render, so nothing worth storing
+    our_names = {BOT_USERNAME}
+    if bot.user is not None:
+        our_names.update(filter(None, (getattr(bot.user, "name", None),
+                                       getattr(bot.user, "display_name", None))))
+    if name in our_names:
+        return  # our own answers travel through a webhook, not this account
+
+    # The command name lives on interaction_metadata in py-cord 2.6;
+    # Message.interaction is deprecated and only warns.
+    command = ""
+    meta = getattr(message, "interaction_metadata", None)
+    if meta is not None:
+        command = getattr(meta, "name", None) or ""
+
+    asyncio.create_task(record_peer_bot(uid, name, command))
+
+
+def render_peer_bots(bots: List[Dict]) -> str:
+    """Prompt section telling the model which other bots exist here."""
+    lines = []
+    for b in bots:
+        line = f"- {b['username']} (id {b['bot_id']})"
+        if b["commands"]:
+            line += " — lệnh đã thấy: " + ", ".join(f"`/{c}`" for c in b["commands"])
+        lines.append(line)
     return (
-        SYSTEM_PROMPT
-        + "\n\n# Facts the group asked you to remember\n"
-        + "Use them when relevant; do not invent any others.\n"
-        + lines
+        "# Bot khác trong server (không phải mình)\n"
+        "Đây là các bot có thật, tự nhận diện từ server. Muốn gọi bot khác "
+        "thì dùng `send_to_channel` với id kênh đích, viết đúng cú pháp lệnh "
+        "của bot đó. Không bịa tên bot hay lệnh chưa thấy ở trên.\n"
+        + "\n".join(lines)
     )
+
+
+async def build_system_prompt() -> str:
+    """Persona + remembered facts + the peer bots discovered in this server."""
+    facts = await get_facts()
+    bots = await get_peer_bots()
+    if not facts and not bots:
+        return SYSTEM_PROMPT
+    parts = [SYSTEM_PROMPT]
+    if facts:
+        lines = "\n".join(
+            f"- {f['fact']} (do {f['author']} nhờ nhớ)" if f["author"] else f"- {f['fact']}"
+            for f in facts
+        )
+        parts.append(
+            "# Facts the group asked you to remember\n"
+            "Use them when relevant; do not invent any others.\n" + lines
+        )
+    if bots:
+        parts.append(render_peer_bots(bots))
+    return "\n\n".join(parts)
 
 async def persist_turn(channel_id: int, history: List[Dict], answer: str) -> None:
     """Append the assistant reply and save, so the exchange actually persists.
@@ -688,6 +837,33 @@ async def on_ready():
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     logger.info(f"Keywords: {KEYWORDS}")
     logger.info(f"Max history: {MAX_HISTORY} exchanges (persistent)")
+    # Seed the peer-bot roster from the member list so bots that have not said
+    # anything yet are already known. REST, no privileged intent required.
+    asyncio.create_task(_seed_peer_bots())
+
+
+async def _seed_peer_bots() -> None:
+    """Discover every bot currently in the guild(s) we are in."""
+    if pool is None:
+        return
+    me = bot.user.id if bot.user else 0
+    for guild in bot.guilds:
+        try:
+            members = await bot.http.get_members(guild.id, limit=1000)
+        except Exception as e:
+            logger.warning(f"peer bot seed failed for {guild.id}: {e}")
+            continue
+        n = 0
+        for m in members or []:
+            u = (m or {}).get("user") or {}
+            if not u.get("bot"):
+                continue
+            uid = int(u.get("id") or 0)
+            if not uid or uid == me:
+                continue
+            await record_peer_bot(uid, u.get("username") or u.get("global_name") or "")
+            n += 1
+        logger.info(f"peer bots discovered in #{getattr(guild, 'name', guild.id)}: {n}")
 
 def strip_mentions(text: str, mentioned_users, bot_id,
                    roles=(), channels=()) -> tuple[str, bool]:
@@ -712,18 +888,18 @@ def strip_mentions(text: str, mentioned_users, bot_id,
     return text.strip(), mentioned
 
 
-async def is_reply_to_bot(message, bot_id: int) -> bool:
-    """True when this message Replies to one of the bot's own messages.
+async def resolve_reply(message, bot_id: int):
+    """Fetch the message this one replies to.
 
-    The model's answers are posted through a Discord webhook, not the bot
-    account, so checking `author.id == bot_id` alone would miss every answer
-    people actually reply to. Any bot-authored target counts, which is what
-    "reply = tag" means in practice.
+    Returns (target, is_reply_to_bot). The answers people actually reply to
+    are posted through a Discord webhook rather than the bot account, so
+    checking `author.id == bot_id` alone would miss every one of them — any
+    bot-authored target counts, which is what "reply = tag" means in practice.
     """
     ref = getattr(message, "reference", None)
     msg_id = getattr(ref, "message_id", None)
     if not msg_id:
-        return False
+        return None, False
     target = getattr(ref, "cached_message", None)
     if target is None:
         # Reference points at a message older than the cache: one REST fetch.
@@ -731,14 +907,40 @@ async def is_reply_to_bot(message, bot_id: int) -> bool:
             target = await message.channel.fetch_message(msg_id)
         except Exception as e:
             logger.warning(f"reply target {msg_id} unavailable: {e}")
-            return False
+            return None, False
     author = getattr(target, "author", None)
     if author is None:
-        return False
-    return getattr(author, "id", None) == bot_id or bool(getattr(author, "bot", False))
+        return None, False
+    is_bot = (getattr(author, "id", None) == bot_id
+              or bool(getattr(author, "bot", False)))
+    return target, is_bot
+
+
+def render_reply_context(target) -> str:
+    """`[Reply tới @Tên: "nội dung"]` so the model knows who is replying to whom.
+
+    Attachments carry no text, so say that instead of quoting nothing.
+    """
+    if target is None:
+        return ""
+    author = getattr(target, "author", None)
+    name = (getattr(author, "display_name", None)
+            or getattr(author, "name", None) or "?")
+    text = (getattr(target, "content", "") or "").strip()
+    if not text and getattr(target, "attachments", None):
+        text = "(đính kèm tệp)"
+    if not text:
+        return f"[Reply tới @{name}] "
+    text = text[:160] + ("…" if len(text) > 160 else "")
+    return f'[Reply tới @{name}: "{text}"] '
 
 @bot.event
 async def on_message(message):
+    # Learn about peer bots from any message they send, including before the
+    # author-bot guard below returns.
+    if getattr(message, "author", None) is not None and message.author.bot:
+        learn_from_message(message)
+
     if message.author.bot:
         return
     
@@ -752,8 +954,14 @@ async def on_message(message):
         channels=getattr(message, "channel_mentions", ()) or (),
     )
     # Reply to one of the bot's messages counts as tagging it — no @ needed.
-    if not mentioned and getattr(message, "reference", None) is not None:
-        mentioned = await is_reply_to_bot(message, bot.user.id if bot.user else 0)
+    # Resolved once: the same target tells us both whether to answer and what
+    # is being replied to, so the model never has to guess who is talking.
+    target, is_reply_to_bot = (None, False)
+    if getattr(message, "reference", None) is not None:
+        target, is_reply_to_bot = await resolve_reply(
+            message, bot.user.id if bot.user else 0)
+    if not mentioned and is_reply_to_bot:
+        mentioned = True
     if not content and mentioned:
         content = "alo"
 
@@ -764,8 +972,12 @@ async def on_message(message):
         await deliver_research(message.channel.send, topic)
         return
 
-    # Prefix the sender so the model knows who is talking (see system prompt persona)
-    turn = {"role": "user", "content": f"[{message.author.display_name}]: {content}"[:STORE_MAX]}
+    # Prefix the sender so the model knows who is talking (see system prompt
+    # persona); a reply carries the quoted message too, so tagging mid-argument
+    # needs no re-explanation.
+    turn = {"role": "user",
+            "content": (render_reply_context(target)
+                        + f"[{message.author.display_name}]: {content}")[:STORE_MAX]}
 
     if not mentioned and not any(kw in content.lower() for kw in KEYWORDS):
         # Plain chatter: keep it as context for the next tag, do not answer.

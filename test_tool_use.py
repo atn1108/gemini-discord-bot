@@ -381,32 +381,161 @@ human_author = type("U", (), {"id": 55, "bot": False})()
 
 channel_stub = ChanStub()
 check("reply: no reference is not a trigger",
-      not run_now(bot_mod.is_reply_to_bot(Msg(human_author), bot_user_obj.id)))
+      run_now(bot_mod.resolve_reply(Msg(human_author), bot_user_obj.id))
+      == (None, False))
 
 msg = Msg(human_author, Ref(1, type("T", (), {"author": webhook_author})()))
+target, is_bot = run_now(bot_mod.resolve_reply(msg, bot_user_obj.id))
 check("reply: replying to the webhook answer triggers",
-      run_now(bot_mod.is_reply_to_bot(msg, bot_user_obj.id)))
+      is_bot and target is not None)
 
 msg = Msg(human_author, Ref(1, type("T", (), {"author": bot_user_obj})()))
 check("reply: replying to the bot itself triggers",
-      run_now(bot_mod.is_reply_to_bot(msg, bot_user_obj.id)))
+      run_now(bot_mod.resolve_reply(msg, bot_user_obj.id))[1])
 
 msg = Msg(human_author, Ref(1, type("T", (), {"author": human_author})()))
 check("reply: replying to a human does not trigger",
-      not run_now(bot_mod.is_reply_to_bot(msg, bot_user_obj.id)))
+      not run_now(bot_mod.resolve_reply(msg, bot_user_obj.id))[1])
 
 # uncached reference -> one REST fetch
 fetch_target = type("T", (), {"author": webhook_author})()
 chan = ChanStub(fetch_target)
 msg = Msg(human_author, Ref(424242), channel=chan)
 check("reply: uncached reference is fetched once",
-      run_now(bot_mod.is_reply_to_bot(msg, bot_user_obj.id)) and chan.fetches == 1,
+      run_now(bot_mod.resolve_reply(msg, bot_user_obj.id))[1] and chan.fetches == 1,
       f"fetches={chan.fetches}")
 
 chan = ChanStub(fail=True)
 msg = Msg(human_author, Ref(424242), channel=chan)
 check("reply: deleted target fails closed",
-      not run_now(bot_mod.is_reply_to_bot(msg, bot_user_obj.id)))
+      not run_now(bot_mod.resolve_reply(msg, bot_user_obj.id))[1])
+
+# ---------- 5b. reply context rendering (who is replying to whom) ----------
+
+class Target:
+    def __init__(self, name, content, attachments=()):
+        self.author = type("A", (), {"display_name": name})()
+        self.content = content
+        self.attachments = list(attachments)
+
+
+check("ctx: no target -> empty", bot_mod.render_reply_context(None) == "")
+check("ctx: quotes the replied text",
+      bot_mod.render_reply_context(Target("Minh", "ai sai?"))
+      == '[Reply tới @Minh: "ai sai?"] ',
+      bot_mod.render_reply_context(Target("Minh", "ai sai?")))
+check("ctx: truncates a long quote",
+      len(bot_mod.render_reply_context(Target("Minh", "x" * 500))) < 250)
+check("ctx: attachment says so instead of quoting nothing",
+      bot_mod.render_reply_context(Target("Minh", "", ["a.png"]))
+      == '[Reply tới @Minh: "(đính kèm tệp)"] ',
+      bot_mod.render_reply_context(Target("Minh", "", ["a.png"])))
+check("ctx: textless target still names the author",
+      bot_mod.render_reply_context(Target("Minh", "")) == "[Reply tới @Minh] ",
+      bot_mod.render_reply_context(Target("Minh", "")))
+
+# ---------- 5c. peer-bot discovery (learned, never hardcoded) ----------
+
+learned = []
+
+
+async def fake_record(bot_id, username, command=""):
+    learned.append((bot_id, username, command))
+
+
+real_record = bot_mod.record_peer_bot
+bot_mod.record_peer_bot = fake_record
+
+
+def drain_tasks(msg):
+    """Call learn_from_message() inside a running loop, then let its task finish.
+
+    Production always calls it from on_message (a live loop); create_task()
+    refuses to run outside one, so the test has to mirror that.
+    """
+    async def _run():
+        bot_mod.learn_from_message(msg)
+        await asyncio.sleep(0)
+    return run_now(_run())
+
+
+class PeerMsg:
+    def __init__(self, author, meta=None):
+        self.author = author
+        self.interaction_metadata = meta
+
+
+bot_mod.bot._connection.user = bot_user_obj
+learned.clear()
+drain_tasks(PeerMsg(webhook_author))
+check("learn: self/our webhook not listed",
+      not learned, str(learned))
+
+peer = type("U", (), {"id": 411916947773587456, "bot": True,
+                      "display_name": "Jockie Music"})()
+learned.clear()
+drain_tasks(PeerMsg(peer))
+check("learn: a peer bot is picked up from its own message",
+      learned and learned[0][0] == 411916947773587456
+      and learned[0][1] == "Jockie Music", str(learned))
+
+meta = type("M", (), {"name": "play"})()
+learned.clear()
+drain_tasks(PeerMsg(peer, meta))
+check("learn: slash command recorded from interaction_metadata",
+      learned and learned[0][2] == "play", str(learned))
+
+human_msg = PeerMsg(human_author)
+human_msg.author = human_author
+learned.clear()
+drain_tasks(human_msg)
+check("learn: humans are not peer bots", not learned, str(learned))
+
+bot_mod.record_peer_bot = real_record
+
+# rendering
+rendered = bot_mod.render_peer_bots([
+    {"bot_id": 1, "username": "Jockie Music", "commands": ["play", "queue"]},
+    {"bot_id": 2, "username": "TempVoice", "commands": []},
+])
+check("render: bot names present",
+      "Jockie Music" in rendered and "TempVoice" in rendered, rendered[:80])
+check("render: learned commands shown",
+      "`/play`" in rendered and "`/queue`" in rendered)
+check("render: bot with no commands still listed", "id 2" in rendered)
+check("render: tells the model not to invent bots",
+      "không bịa" in rendered.lower())
+
+# prompt wiring: persona + facts + peer bots in one build
+async def prompt_check():
+    real_facts, real_bots = bot_mod.get_facts, bot_mod.get_peer_bots
+    real_prompt = bot_mod.SYSTEM_PROMPT
+    bot_mod.SYSTEM_PROMPT = "PERSONA"
+
+    async def no_facts():
+        return []
+
+    async def no_bots():
+        return []
+
+    async def some_bots():
+        return [{"bot_id": 1, "username": "Dyno", "commands": ["dadjoke"]}]
+
+    bot_mod.get_facts, bot_mod.get_peer_bots = no_facts, no_bots
+    p = await bot_mod.build_system_prompt()
+    check("prompt: nothing to add -> persona untouched", p == "PERSONA", p[:60])
+
+    bot_mod.get_peer_bots = some_bots
+    p = await bot_mod.build_system_prompt()
+    check("prompt: peer bots section added", "# Bot khác trong server" in p)
+    check("prompt: persona still first", p.startswith("PERSONA"))
+    check("prompt: learned command reaches the model", "`/dadjoke`" in p)
+
+    bot_mod.get_facts, bot_mod.get_peer_bots = real_facts, real_bots
+    bot_mod.SYSTEM_PROMPT = real_prompt
+
+
+run_now(prompt_check())
 
 # ---------- 6. schema sanity ----------
 
