@@ -7,6 +7,7 @@ import json
 import io
 import re
 import asyncio
+import datetime
 from collections import defaultdict, deque
 from typing import List, Dict, Optional
 import time
@@ -28,6 +29,17 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "Gemini Bot")
 BOT_AVATAR = os.getenv("BOT_AVATAR", "")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# ===== PRIVILEGE / TOOL USE =====
+# Discord user IDs allowed to run server-management tools (kick/ban/timeout/
+# channels/roles/nicknames). Guild owners and members with the Administrator
+# permission are always allowed, so an empty list is still safe.
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()}
+# Escape hatch: turn the whole tool layer off without a code change if the tool
+# bridge starts degrading answers.
+ENABLE_TOOLS = os.getenv("ENABLE_TOOLS", "true").strip().lower() in ("1", "true", "yes", "on")
+# Hard cap on tool round-trips per question so a confused model cannot spin.
+MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "4"))
 
 # ===== DEEP RESEARCH =====
 DEEP_RESEARCH_URL = os.getenv(
@@ -63,7 +75,13 @@ Xưng "em" hoặc "bé", gọi các thành viên theo tên hiển thị (nếu c
 # Format Rules (Chuẩn Discord)
 - Dùng **in đậm** cho ý chính, gạch đầu dòng (`-`) cho các mục.
 - Code đặt trong block ```ngôn_ngữ ... ```.
-- Tối ưu độ dài: câu hỏi thường trả lời trong 1–4 câu; hướng dẫn kỹ thuật hoặc tổng hợp tin tức thì chia ý rõ ràng, đủ bước."""
+- Tối ưu độ dài: câu hỏi thường trả lời trong 1–4 câu; hướng dẫn kỹ thuật hoặc tổng hợp tin tức thì chia ý rõ ràng, đủ bước.
+
+# Tool Use (Công cụ quản lý server)
+- Khi thành viên yêu cầu thao tác trên server (kick/ban/timeout, tạo/xóa kênh, đổi biệt danh, thêm/bỏ role), gọi tool tương ứng thay vì chỉ hứa làm.
+- Người được nhắc trong tin nhắn đã hiển thị dạng `@Tên(id)` — dùng đúng id đó làm tham số, không tự bịa id.
+- Tool quản trị chỉ chạy khi người yêu cầu là admin; nếu kết quả là DENIED thì báo thẳng người đó không đủ quyền, không thử lại hay lách.
+- Không gọi tool khi thành viên chỉ đang trò chuyện thông thường."""
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 
 # ===== DATABASE =====
@@ -206,6 +224,230 @@ async def persist_turn(channel_id: int, history: List[Dict], answer: str) -> Non
     if answer:
         history.append({"role": "assistant", "content": answer[:STORE_MAX]})
     await save_history(channel_id, history)
+
+
+# ===== TOOL USE (function calling) =====
+# The upstream gemini-web-to-api tool bridge turns these OpenAI schemas into a
+# prompt; Gemini answers with tool_calls, which we execute here and feed back.
+# Everything that mutates the server is admin-only — see is_admin().
+
+# Tool schemas sent with each request when ENABLE_TOOLS is on.
+TOOLS: List[Dict] = [
+    {"type": "function", "function": {
+        "name": "kick",
+        "description": "Kick a member from the server. Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "member_id": {"type": "string", "description": "Discord user ID of the member to kick"},
+            "reason": {"type": "string", "description": "Optional reason shown in the audit log"}},
+            "required": ["member_id"]}}},
+    {"type": "function", "function": {
+        "name": "ban",
+        "description": "Ban a member from the server. Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "member_id": {"type": "string", "description": "Discord user ID of the member to ban"},
+            "reason": {"type": "string", "description": "Optional reason"},
+            "delete_message_seconds": {"type": "integer",
+                                       "description": "Seconds of messages to delete (0-604800)"}},
+            "required": ["member_id"]}}},
+    {"type": "function", "function": {
+        "name": "timeout",
+        "description": "Timeout (mute) a member for a number of minutes. Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "member_id": {"type": "string", "description": "Discord user ID"},
+            "minutes": {"type": "integer", "description": "How long in minutes (1-40320)"},
+            "reason": {"type": "string", "description": "Optional reason"}},
+            "required": ["member_id", "minutes"]}}},
+    {"type": "function", "function": {
+        "name": "create_channel",
+        "description": "Create a new text channel in this server. Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Channel name (lowercase, hyphenated)"}},
+            "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "delete_channel",
+        "description": "Delete a channel by ID. Admin only. Destructive.",
+        "parameters": {"type": "object", "properties": {
+            "channel_id": {"type": "string", "description": "Discord channel ID to delete"}},
+            "required": ["channel_id"]}}},
+    {"type": "function", "function": {
+        "name": "set_nickname",
+        "description": "Change a member's nickname in this server. Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "member_id": {"type": "string", "description": "Discord user ID"},
+            "nickname": {"type": "string", "description": "New nickname (empty string to reset)"}},
+            "required": ["member_id", "nickname"]}}},
+    {"type": "function", "function": {
+        "name": "add_role",
+        "description": "Add a role to a member by role ID. Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "member_id": {"type": "string", "description": "Discord user ID"},
+            "role_id": {"type": "string", "description": "Discord role ID"}},
+            "required": ["member_id", "role_id"]}}},
+    {"type": "function", "function": {
+        "name": "remove_role",
+        "description": "Remove a role from a member by role ID. Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "member_id": {"type": "string", "description": "Discord user ID"},
+            "role_id": {"type": "string", "description": "Discord role ID"}},
+            "required": ["member_id", "role_id"]}}},
+    # Bot-to-bot / coordination: the bot can hand text to another webhook or
+    # read the last messages of a channel. Read-only, safe for anyone.
+    {"type": "function", "function": {
+        "name": "read_channel",
+        "description": "Read the last N messages of a channel in this server.",
+        "parameters": {"type": "object", "properties": {
+            "channel_id": {"type": "string", "description": "Discord channel ID"},
+            "limit": {"type": "integer", "description": "How many messages (1-20)"}},
+            "required": ["channel_id"]}}},
+    {"type": "function", "function": {
+        "name": "send_to_channel",
+        "description": "Send a message to another channel in this server (e.g. to talk to another bot).",
+        "parameters": {"type": "object", "properties": {
+            "channel_id": {"type": "string", "description": "Discord channel ID"},
+            "content": {"type": "string", "description": "Message text to send"}},
+            "required": ["channel_id", "content"]}}},
+]
+
+# Tools that require admin rights. read_channel/send_to_channel are open.
+DANGEROUS_TOOLS = {"kick", "ban", "timeout", "create_channel", "delete_channel",
+                   "set_nickname", "add_role", "remove_role"}
+
+
+async def is_admin(member: Optional[discord.Member], guild: Optional[discord.Guild]) -> bool:
+    """True when the member may run server-management tools.
+
+    Admin = explicit ADMIN_IDS ∪ guild owner ∪ Administrator permission.
+    Fail-closed: no member object or no guild means not an admin.
+    """
+    if member is None or guild is None:
+        return False
+    if member.id in ADMIN_IDS:
+        return True
+    if guild.owner_id == member.id:
+        return True
+    try:
+        return bool(member.guild_permissions.administrator)
+    except Exception:
+        return False
+
+
+async def resolve_member(guild: discord.Guild, member_id: str) -> Optional[discord.Member]:
+    """Look up a member by ID without privileged intents (REST fetch)."""
+    try:
+        return await guild.fetch_member(int(member_id))
+    except Exception as e:
+        logger.warning(f"fetch_member({member_id}) failed: {e}")
+        # Fall back to the cache if REST fails.
+        return guild.get_member(int(member_id)) if str(member_id).isdigit() else None
+
+
+async def execute_tool(name: str, args: Dict, guild: discord.Guild,
+                       channel: discord.abc.GuildChannel,
+                       caller: Optional[discord.Member],
+                       admin: bool) -> str:
+    """Run one tool and return a result string for the model.
+
+    Admin-gated tools are refused for non-admins with a clear message, so the
+    model can tell the user why instead of silently failing.
+    """
+    if name in DANGEROUS_TOOLS and not admin:
+        return (f"DENIED: '{name}' requires admin rights. "
+                f"{getattr(caller, 'display_name', 'This user')} is not an admin.")
+
+    try:
+        if name == "kick":
+            member = await resolve_member(guild, args.get("member_id", ""))
+            if member is None:
+                return f"ERROR: member {args.get('member_id')} not found"
+            if member.id == guild.owner_id or member.id in ADMIN_IDS:
+                return "ERROR: cannot kick an owner/admin"
+            await member.kick(reason=args.get("reason") or f"by {BOT_USERNAME}")
+            return f"Kicked {member.display_name} ({member.id})"
+
+        if name == "ban":
+            member = await resolve_member(guild, args.get("member_id", ""))
+            if member is None:
+                # Banning an ID not in cache still works via REST ban.
+                await guild.ban(discord.Object(id=int(args.get("member_id", 0))),
+                                delete_message_seconds=int(args.get("delete_message_seconds") or 0),
+                                reason=args.get("reason") or f"by {BOT_USERNAME}")
+                return f"Banned user {args.get('member_id')}"
+            if member.id == guild.owner_id or member.id in ADMIN_IDS:
+                return "ERROR: cannot ban an owner/admin"
+            await member.ban(delete_message_seconds=int(args.get("delete_message_seconds") or 0),
+                             reason=args.get("reason") or f"by {BOT_USERNAME}")
+            return f"Banned {member.display_name} ({member.id})"
+
+        if name == "timeout":
+            member = await resolve_member(guild, args.get("member_id", ""))
+            if member is None:
+                return f"ERROR: member {args.get('member_id')} not found"
+            minutes = max(1, min(int(args.get("minutes") or 1), 40320))
+            until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=minutes)
+            await member.timeout(until, reason=args.get("reason") or f"by {BOT_USERNAME}")
+            return f"Timed out {member.display_name} for {minutes} min"
+
+        if name == "create_channel":
+            cname = (args.get("name") or "").strip().lower().replace(" ", "-")[:100]
+            if not cname:
+                return "ERROR: empty channel name"
+            new_ch = await guild.create_text_channel(cname, reason=f"by {BOT_USERNAME}")
+            return f"Created channel <#{new_ch.id}> ({new_ch.id})"
+
+        if name == "delete_channel":
+            cid = int(args.get("channel_id") or 0)
+            target = guild.get_channel(cid)
+            if target is None:
+                return f"ERROR: channel {cid} not found in this server"
+            if target.id == channel.id:
+                return "ERROR: refusing to delete the current channel"
+            await target.delete(reason=f"by {BOT_USERNAME}")
+            return f"Deleted channel {cid}"
+
+        if name == "set_nickname":
+            member = await resolve_member(guild, args.get("member_id", ""))
+            if member is None:
+                return f"ERROR: member {args.get('member_id')} not found"
+            nick = (args.get("nickname") or "").strip() or None
+            await member.edit(nick=nick, reason=f"by {BOT_USERNAME}")
+            return f"Set nickname of {member.display_name} to {nick or '(default)'}"
+
+        if name in ("add_role", "remove_role"):
+            member = await resolve_member(guild, args.get("member_id", ""))
+            if member is None:
+                return f"ERROR: member {args.get('member_id')} not found"
+            role = guild.get_role(int(args.get("role_id") or 0))
+            if role is None:
+                return f"ERROR: role {args.get('role_id')} not found"
+            if name == "add_role":
+                await member.add_roles(role, reason=f"by {BOT_USERNAME}")
+                return f"Added role {role.name} to {member.display_name}"
+            await member.remove_roles(role, reason=f"by {BOT_USERNAME}")
+            return f"Removed role {role.name} from {member.display_name}"
+
+        if name == "read_channel":
+            target = guild.get_channel(int(args.get("channel_id") or 0))
+            if target is None:
+                return f"ERROR: channel not found"
+            limit = max(1, min(int(args.get("limit") or 5), 20))
+            lines = []
+            async for m in target.history(limit=limit):
+                who = getattr(m.author, "display_name", "?")
+                lines.append(f"[{who}] {m.content[:200]}")
+            return "\n".join(reversed(lines)) or "(no messages)"
+
+        if name == "send_to_channel":
+            target = guild.get_channel(int(args.get("channel_id") or 0))
+            if target is None:
+                return f"ERROR: channel not found"
+            content = (args.get("content") or "")[:1900]
+            await target.send(content)
+            return f"Sent to channel {target.id}"
+
+        return f"ERROR: unknown tool '{name}'"
+    except Exception as e:
+        logger.warning(f"tool {name} failed: {e}")
+        return f"ERROR: {name} failed: {e}"
 
 # ===== DEEP RESEARCH =====
 def chunk_text(text: str, limit: int = 1900) -> List[str]:
@@ -366,13 +608,18 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = discord.Bot(intents=intents)
 
-async def call_webhook(history: List[Dict], channel_id: int) -> tuple[bool, dict]:
+async def call_webhook(history: List[Dict], channel_id: int,
+                       tools: Optional[List[Dict]] = None) -> tuple[bool, dict]:
     payload = {
         "messages": history,
         "system": await build_system_prompt(),
         "username": BOT_USERNAME,
         "avatar_url": BOT_AVATAR
     }
+    if tools and ENABLE_TOOLS:
+        # OpenAI tool schemas; the upstream bridge turns them into a prompt and
+        # may answer with tool_calls instead of text.
+        payload["tools"] = tools
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(WEBHOOK_URL, json=payload)
@@ -381,23 +628,114 @@ async def call_webhook(history: List[Dict], channel_id: int) -> tuple[bool, dict
         logger.error(f"Webhook error: {e}")
         return False, {"error": str(e)}
 
+
+async def run_tool_loop(messages: List[Dict], channel_id: int,
+                        guild: Optional[discord.Guild],
+                        channel, caller) -> tuple[bool, dict]:
+    """Ask the model, executing whatever tools it requests, then return.
+
+    Works on a copy of `messages`: the tool_calls/tool protocol rows are for
+    one exchange only and must never reach the stored transcript.
+
+    The forwarder posts to Discord only for a text answer, and a text answer
+    ends the loop, so every completed round lands exactly one message in the
+    channel. The final round offers no tools at all, which forces a text
+    answer and bounds the loop even if the model keeps asking for tools.
+    """
+    if not ENABLE_TOOLS or guild is None:
+        return await call_webhook(messages, channel_id)
+
+    admin = await is_admin(caller, guild)
+    # Non-admins are never even offered the destructive tools, so "kick X"
+    # from a random member cannot reach execute_tool in the first place.
+    pool = TOOLS if admin else [t for t in TOOLS
+                                if t["function"]["name"] not in DANGEROUS_TOOLS]
+
+    work = list(messages)
+    for round_no in range(MAX_TOOL_ROUNDS + 1):
+        use_tools = pool if round_no < MAX_TOOL_ROUNDS else None
+        ok, result = await call_webhook(work, channel_id, tools=use_tools)
+        if not ok:
+            return False, result
+
+        tool_calls = result.get("tool_calls") or []
+        if not tool_calls:
+            return True, result  # text answer: the forwarder already posted it
+        if use_tools is None:
+            # Unreachable while the bridge only answers with tool_calls when
+            # tools were sent, but never hand raw JSON to the channel.
+            return False, {"error": "model exceeded the tool round limit"}
+
+        # Keep the protocol rows for the next round, out of the DB transcript.
+        work.append({"role": "assistant", "content": result.get("content") or "",
+                     "tool_calls": tool_calls})
+        for tc in tool_calls:
+            fn = tc.get("function") or {}
+            name = fn.get("name") or "?"
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                args = {}
+            out = await execute_tool(name, args, guild, channel, caller, admin)
+            logger.info(f"tool {name}(round {round_no + 1}) admin={admin} -> {out[:120]!r}")
+            work.append({"role": "tool", "tool_call_id": tc.get("id", ""),
+                         "content": out})
+
+    return False, {"error": "tool loop did not terminate"}
+
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     logger.info(f"Keywords: {KEYWORDS}")
     logger.info(f"Max history: {MAX_HISTORY} exchanges (persistent)")
 
-def strip_mentions(text: str, mentioned_users, bot_id) -> tuple[str, bool]:
-    """Drop the bot's own mention token and render every other one as @name.
+def strip_mentions(text: str, mentioned_users, bot_id,
+                   roles=(), channels=()) -> tuple[str, bool]:
+    """Drop the bot's own mention token and render every other one with its ID.
 
-    Returns (text, mentioned); mentioned means the bot itself was tagged, and
-    tagging the bot counts as a trigger even without a keyword.
+    IDs are what make the moderation tools usable: "@Đạo(999)" gives the model
+    everything it needs to fill a member_id / role_id argument, which plain
+    "@Đạo" never could. Returns (text, mentioned) where mentioned means the
+    bot itself was tagged — tagging the bot counts as a trigger with no
+    keyword, and so does a Reply to one of its messages.
     """
     mentioned = any(u.id == bot_id for u in mentioned_users)
     for user in mentioned_users:
-        replacement = "" if user.id == bot_id else f"@{user.display_name}"
+        replacement = "" if user.id == bot_id else f"@{user.display_name}({user.id})"
         text = text.replace(f"<@{user.id}>", replacement).replace(f"<@!{user.id}>", replacement)
+    # Role / channel tokens have no "mention" semantics for us, but the model
+    # needs their IDs too (add_role, delete_channel, send_to_channel).
+    for role in roles:
+        text = text.replace(f"<@&{role.id}>", f"@{role.name}({role.id})")
+    for ch in channels:
+        text = text.replace(f"<#{ch.id}>", f"#{ch.name}({ch.id})")
     return text.strip(), mentioned
+
+
+async def is_reply_to_bot(message, bot_id: int) -> bool:
+    """True when this message Replies to one of the bot's own messages.
+
+    The model's answers are posted through a Discord webhook, not the bot
+    account, so checking `author.id == bot_id` alone would miss every answer
+    people actually reply to. Any bot-authored target counts, which is what
+    "reply = tag" means in practice.
+    """
+    ref = getattr(message, "reference", None)
+    msg_id = getattr(ref, "message_id", None)
+    if not msg_id:
+        return False
+    target = getattr(ref, "cached_message", None)
+    if target is None:
+        # Reference points at a message older than the cache: one REST fetch.
+        try:
+            target = await message.channel.fetch_message(msg_id)
+        except Exception as e:
+            logger.warning(f"reply target {msg_id} unavailable: {e}")
+            return False
+    author = getattr(target, "author", None)
+    if author is None:
+        return False
+    return getattr(author, "id", None) == bot_id or bool(getattr(author, "bot", False))
 
 @bot.event
 async def on_message(message):
@@ -408,7 +746,14 @@ async def on_message(message):
     if not content:
         return
 
-    content, mentioned = strip_mentions(content, message.mentions, bot.user.id if bot.user else 0)
+    content, mentioned = strip_mentions(
+        content, message.mentions, bot.user.id if bot.user else 0,
+        roles=getattr(message, "role_mentions", ()) or (),
+        channels=getattr(message, "channel_mentions", ()) or (),
+    )
+    # Reply to one of the bot's messages counts as tagging it — no @ needed.
+    if not mentioned and getattr(message, "reference", None) is not None:
+        mentioned = await is_reply_to_bot(message, bot.user.id if bot.user else 0)
     if not content and mentioned:
         content = "alo"
 
@@ -457,7 +802,12 @@ async def on_message(message):
         messages = history + list(pending.get(channel_id, ())) + [turn]
 
         async with message.channel.typing():
-            success, result = await call_webhook(messages, channel_id)
+            success, result = await run_tool_loop(
+                messages, channel_id,
+                guild=getattr(message, "guild", None),
+                channel=message.channel,
+                caller=message.author,
+            )
 
         if success:
             # The buffered chatter is stored now, so it stops being pending.
@@ -512,7 +862,10 @@ async def ask(ctx, question: str):
     history = await get_history(ctx.channel.id)
     history.append({"role": "user", "content": question})
     
-    success, result = await call_webhook(history, ctx.channel.id)
+    success, result = await run_tool_loop(
+        history, ctx.channel.id,
+        guild=ctx.guild, channel=ctx.channel, caller=ctx.author,
+    )
     if success:
         await persist_turn(ctx.channel.id, history, result.get("answer", ""))
         await ctx.followup.send("✅ Sent! Response will appear shortly.")

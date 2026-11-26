@@ -74,11 +74,21 @@ check("mention: tag + text strips token",
 check("mention: nickname form stripped",
       bot_mod.strip_mentions(f"<@!{BOT_ID}> yo", [bot_user], BOT_ID) == ("yo", True))
 check("mention: no tag", bot_mod.strip_mentions("bé yêu hi", [], BOT_ID) == ("bé yêu hi", False))
-check("mention: other user rendered",
-      bot_mod.strip_mentions(f"<@{other.id}> la ai", [other], BOT_ID) == ("@Đạo la ai", False))
+check("mention: other user rendered with id for tools",
+      bot_mod.strip_mentions(f"<@{other.id}> la ai", [other], BOT_ID)
+      == ("@Đạo(999) la ai", False))
 text, mentioned = bot_mod.strip_mentions(
     f"<@{BOT_ID}> hoi <@{other.id}>", [bot_user, other], BOT_ID)
-check("mention: both handled", (text, mentioned) == ("hoi @Đạo", True), f"got={(text, mentioned)}")
+check("mention: both handled", (text, mentioned) == ("hoi @Đạo(999)", True),
+      f"got={(text, mentioned)}")
+
+# role / channel tokens carry their IDs too (add_role, delete_channel need them)
+Role = type("Role", (), {"id": 777, "name": "Mod"})
+Chan = type("Chan", (), {"id": 555, "name": "general"})
+text, _ = bot_mod.strip_mentions("cho <@&777> vao <#555>", [], BOT_ID,
+                                 roles=[Role()], channels=[Chan()])
+check("mention: role rendered with id", text == "cho @Mod(777) vao #general(555)",
+      text)
 
 tmp_buf = bot_mod.pending[999999]
 check("pending buffer is capped", tmp_buf.maxlen == bot_mod.PENDING_MAX,
