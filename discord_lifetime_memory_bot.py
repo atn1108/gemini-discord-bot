@@ -883,7 +883,8 @@ async def _resolve_google_news_url(client: httpx.AsyncClient, raw_url: str) -> s
     if "/articles/" not in parsed.path and "/read/" not in parsed.path:
         return raw_url
     try:
-        page = await client.get(raw_url, follow_redirects=True)
+        hdrs = _fetch_headers_for(raw_url)
+        page = await client.get(raw_url, follow_redirects=True, headers=hdrs)
         if page.status_code != 200:
             return raw_url
         m_id = re.search(r'data-n-a-id="([^"]+)"', page.text)
@@ -900,6 +901,7 @@ async def _resolve_google_news_url(client: httpx.AsyncClient, raw_url: str) -> s
             "https://news.google.com/_/DotsSplashUi/data/batchexecute",
             content=body,
             headers={
+                **hdrs,
                 "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
                 "Referer": "https://news.google.com/",
             },
@@ -912,17 +914,28 @@ async def _resolve_google_news_url(client: httpx.AsyncClient, raw_url: str) -> s
     return raw_url
 
 
+def _fetch_headers_for(url: str) -> Dict[str, str]:
+    """Use a descriptive bot User-Agent for Wikimedia (required by its robot policy)."""
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if host.endswith(("wikipedia.org", "wiktionary.org", "wikimedia.org", "wikidata.org")):
+        return {"User-Agent": "BeYeuBot/1.0 (https://github.com/atn1108/gemini-discord-bot)"}
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
+    }
+
+
 async def _fetch_url(url: str) -> str:
     cur = (url or "").strip()
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0"}
-    async with httpx.AsyncClient(timeout=15, follow_redirects=False, headers=headers) as client:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
         cur = await _resolve_google_news_url(client, cur)
         resp = None
         for _ in range(5):
             ok, reason = _is_safe_public_url(cur)
             if not ok:
                 return f"ERROR: blocked URL ({reason})"
-            resp = await client.get(cur)
+            resp = await client.get(cur, headers=_fetch_headers_for(cur))
             if resp.is_redirect and resp.headers.get("location"):
                 cur = urllib.parse.urljoin(cur, resp.headers["location"])
                 continue

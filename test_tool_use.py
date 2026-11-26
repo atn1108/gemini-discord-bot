@@ -794,6 +794,10 @@ async def gnews_decode_check():
 
 
 run_now(gnews_decode_check())
+check("fetch headers: Wikimedia uses descriptive bot UA",
+      bot_mod._fetch_headers_for("https://en.wiktionary.org/wiki/hello")["User-Agent"].startswith("BeYeuBot/"))
+check("fetch headers: general site keeps full Chrome UA",
+      "AppleWebKit/537.36" in bot_mod._fetch_headers_for("https://example.com")["User-Agent"])
 
 # 7c. send_file & read_channel embed fallback
 async def file_and_embed_checks():
