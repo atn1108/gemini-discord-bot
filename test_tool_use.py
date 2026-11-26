@@ -748,6 +748,53 @@ async def prompt_date_check():
 
 run_now(prompt_date_check())
 
+# 7b-2. Google News RSS article redirect resolution + SSRF guard
+async def gnews_decode_check():
+    class FakePage:
+        def __init__(self, code, text, headers=None):
+            self.status_code = code
+            self.text = text
+            self.headers = headers or {}
+            self.is_redirect = False
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+    class FakeGNewsClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            if "news.google.com/rss/articles/" in url:
+                return FakePage(200, '<c-wiz data-n-a-id="ART1" data-n-a-ts="1795000" data-n-a-sg="SIG1"></c-wiz>')
+            if url == "https://publisher.example/article":
+                return FakePage(200, "<html><body><p>Bedrock bug details here</p></body></html>", {"content-type": "text/html"})
+            return FakePage(404, "")
+
+        async def post(self, url, **kw):
+            return FakePage(200, ')]}\'\n[["wrb.fr","Fbv4je","[\\"garturlres\\",\\"https://publisher.example/article\\",1]"]]')
+
+    real_client = bot_mod.httpx.AsyncClient
+    real_safe = bot_mod._is_safe_public_url
+    bot_mod.httpx.AsyncClient = FakeGNewsClient
+    bot_mod._is_safe_public_url = lambda u: (True, "") if "publisher.example" in u or "news.google.com" in u else real_safe(u)
+    try:
+        body = await bot_mod._fetch_url("https://news.google.com/rss/articles/CBMiTEST")
+        check("gnews decode: fetches resolved publisher article", "Bedrock bug details here" in body, body)
+    finally:
+        bot_mod.httpx.AsyncClient = real_client
+        bot_mod._is_safe_public_url = real_safe
+
+
+run_now(gnews_decode_check())
+
 # 7c. send_file & read_channel embed fallback
 async def file_and_embed_checks():
     sent_files = []

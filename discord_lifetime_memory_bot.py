@@ -875,10 +875,48 @@ async def _web_search(query: str, max_results: int = 5) -> str:
     return "\n".join(lines)
 
 
+async def _resolve_google_news_url(client: httpx.AsyncClient, raw_url: str) -> str:
+    """Decode a news.google.com/rss/articles/... wrapper link to its real publisher URL."""
+    parsed = urllib.parse.urlparse(raw_url)
+    if (parsed.hostname or "").lower() != "news.google.com":
+        return raw_url
+    if "/articles/" not in parsed.path and "/read/" not in parsed.path:
+        return raw_url
+    try:
+        page = await client.get(raw_url, follow_redirects=True)
+        if page.status_code != 200:
+            return raw_url
+        m_id = re.search(r'data-n-a-id="([^"]+)"', page.text)
+        m_ts = re.search(r'data-n-a-ts="([^"]+)"', page.text)
+        m_sg = re.search(r'data-n-a-sg="([^"]+)"', page.text)
+        if not (m_id and m_ts and m_sg):
+            return raw_url
+        payload = [
+            "Fbv4je",
+            f'["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,null,null,null,null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],"{m_id.group(1)}",{m_ts.group(1)},"{m_sg.group(1)}"]',
+        ]
+        body = "f.req=" + urllib.parse.quote(json.dumps([[payload]]))
+        bresp = await client.post(
+            "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+            content=body,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                "Referer": "https://news.google.com/",
+            },
+        )
+        m_url = re.search(r'garturlres\\",\\"(https?://[^\\"]+)', bresp.text)
+        if m_url:
+            return m_url.group(1).encode("utf-8").decode("unicode_escape")
+    except Exception as e:
+        logger.warning(f"google news redirect decode failed: {e}")
+    return raw_url
+
+
 async def _fetch_url(url: str) -> str:
     cur = (url or "").strip()
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0"}
     async with httpx.AsyncClient(timeout=15, follow_redirects=False, headers=headers) as client:
+        cur = await _resolve_google_news_url(client, cur)
         resp = None
         for _ in range(5):
             ok, reason = _is_safe_public_url(cur)
