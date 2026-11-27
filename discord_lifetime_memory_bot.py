@@ -1047,14 +1047,10 @@ def _get_ytdlp_cookiefile() -> Optional[str]:
     return None
 
 
-def _resolve_spotify_query(url: str) -> Optional[str]:
-    """Resolve a Spotify track/album URL to a searchable 'title' string via public oEmbed."""
+def _oembed_title(endpoint: str, url: str) -> Optional[str]:
+    """Fetch a track/video title from a public oEmbed endpoint (bypasses bot checks)."""
     try:
-        r = httpx.get(
-            "https://open.spotify.com/oembed",
-            params={"url": url},
-            timeout=8,
-        )
+        r = httpx.get(endpoint, params={"url": url, "format": "json"}, timeout=8)
         if r.status_code == 200:
             title = (r.json().get("title") or "").strip()
             if title:
@@ -1084,11 +1080,12 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
 
     q = query.strip()
     if "open.spotify.com/" in q.lower():
-        resolved = _resolve_spotify_query(q)
+        resolved = _oembed_title("https://open.spotify.com/oembed", q)
         if resolved:
             q = resolved
 
     is_url = q.startswith(("http://", "https://"))
+    is_yt_url = is_url and any(h in q.lower() for h in ("youtube.com/", "youtu.be/"))
     has_prefix = q.lower().startswith(("ytsearch", "scsearch"))
     if is_url or has_prefix:
         targets = [q]
@@ -1106,27 +1103,35 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
     cookiefile = _get_ytdlp_cookiefile()
     if cookiefile:
         base_opts["cookiefile"] = cookiefile
+    yt_args: Dict[str, Any] = {"player_client": ["tv", "android_vr", "web"]}
     if YTDLP_PO_TOKEN:
-        base_opts["extractor_args"] = {"youtube": {"po_token": [f"web+{YTDLP_PO_TOKEN}"]}}
+        yt_args["po_token"] = [f"web+{YTDLP_PO_TOKEN}"]
+    base_opts["extractor_args"] = {"youtube": yt_args}
 
     last_err: Optional[Exception] = None
     info = None
-    for target in targets:
+    idx = 0
+    while idx < len(targets):
+        target = targets[idx]
+        idx += 1
         try:
             with yt_dlp.YoutubeDL(base_opts) as ydl:
                 info = ydl.extract_info(target, download=False)
             if info:
                 if "entries" in info:
                     entries = [e for e in (info.get("entries") or []) if e]
-                    if entries:
-                        info = entries[0]
-                    else:
-                        info = None
+                    info = entries[0] if entries else None
                 if info and info.get("url"):
                     break
         except Exception as e:
             last_err = e
             info = None
+            # If a direct YouTube URL hits bot-check on datacenter IP, resolve its title
+            # via YouTube oEmbed and fall back to SoundCloud search automatically.
+            if is_yt_url and target == q:
+                yt_title = _oembed_title("https://www.youtube.com/oembed", q)
+                if yt_title:
+                    targets.append(f"scsearch1:{yt_title}")
 
     if not info or not info.get("url"):
         raise ValueError(str(last_err) if last_err else "No playable audio stream URL returned")

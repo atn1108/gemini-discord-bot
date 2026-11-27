@@ -165,6 +165,26 @@ async def main():
         res = await b.execute_tool("speak", {"text": "alo"}, guild, channel, caller, admin=False)
         check("speak", "Spoke in #Sảnh" in res, res)
 
+    # 10. YouTube URL bot-check -> oEmbed -> SoundCloud fallback
+    class FakeYDL:
+        def __init__(self, _opts):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+        def extract_info(self, target, download=False):
+            if "youtu.be" in target:
+                raise RuntimeError("Sign in to confirm you're not a bot")
+            return {"title": "One More Lawn", "url": "https://sc.example/stream.m3u8", "duration": 155}
+
+    import sys
+    fake_ytdlp = types.SimpleNamespace(YoutubeDL=FakeYDL)
+    with patch.dict(sys.modules, {"yt_dlp": fake_ytdlp}), \
+         patch.object(b, "_oembed_title", return_value="One More Lawn"):
+        tr = b._extract_track_info("https://youtu.be/kvsDx1AEjJE")
+        check("yt bot-check fallback to scsearch", tr["title"] == "One More Lawn", tr)
+
     print("\nALL NEW TOOLS PASSED")
 
 
