@@ -1122,14 +1122,25 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
                     entries = [e for e in (info.get("entries") or []) if e]
                     info = entries[0] if entries else None
                 if info and info.get("url"):
+                    # Verify googlevideo stream URL is actually readable with its headers
+                    # (Railway datacenter IPs often get 403 on ANDROID_VR / WEB without PO token).
+                    if "googlevideo.com" in info["url"]:
+                        hdrs = dict(info.get("http_headers") or {})
+                        hdrs["Range"] = "bytes=0-1"
+                        probe = httpx.get(info["url"], headers=hdrs, follow_redirects=True, timeout=8)
+                        if probe.status_code == 403:
+                            raise ValueError(f"googlevideo returned 403 for {info.get('title') or target}")
                     break
         except Exception as e:
             last_err = e
+            yt_title = None
+            if info and isinstance(info, dict):
+                yt_title = info.get("title")
             info = None
-            # If a direct YouTube URL hits bot-check on datacenter IP, resolve its title
+            # If a direct YouTube URL hits bot-check or 403 on datacenter IP, resolve its title
             # via YouTube oEmbed and fall back to SoundCloud search automatically.
             if is_yt_url and target == q:
-                yt_title = _oembed_title("https://www.youtube.com/oembed", q)
+                yt_title = yt_title or _oembed_title("https://www.youtube.com/oembed", q)
                 if yt_title:
                     targets.append(f"scsearch1:{yt_title}")
 
@@ -1139,19 +1150,28 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
     return {
         "title": info.get("title") or q,
         "stream_url": info["url"],
+        "http_headers": dict(info.get("http_headers") or {}),
         "webpage_url": info.get("webpage_url") or (q if is_url else ""),
         "duration": info.get("duration") or 0,
     }
 
 
-def _create_audio_source(stream_url: str, volume: float = 1.0):
+def _create_audio_source(stream_url: str, volume: float = 1.0, http_headers: Optional[Dict[str, str]] = None):
     is_hls = ".m3u8" in (stream_url or "").lower()
     is_http = (stream_url or "").startswith(("http://", "https://"))
-    before = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5" if (is_http and not is_hls) else None
+    parts = []
+    if is_http and not is_hls:
+        parts.append("-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
+    if is_http and http_headers:
+        ua = http_headers.get("User-Agent")
+        if ua:
+            safe_ua = ua.replace('"', "")
+            parts.append(f'-user_agent "{safe_ua}"')
+    before = " ".join(parts) if parts else None
     raw = discord.FFmpegPCMAudio(
         stream_url,
         before_options=before,
-        options="-vn -ar 48000 -ac 2",
+        options="-vn",
     )
     return discord.PCMVolumeTransformer(raw, volume=max(0.0, min(float(volume), 2.0)))
 
@@ -1199,7 +1219,8 @@ async def _play_next_track(guild: discord.Guild) -> None:
                 logger.warning(f"queued track refresh failed for {nxt.get('title')}: {e}")
         state.current = nxt
         try:
-            source = _create_audio_source(nxt["stream_url"])
+            hdrs = nxt.get("http_headers")
+            source = _create_audio_source(nxt["stream_url"], http_headers=hdrs) if hdrs else _create_audio_source(nxt["stream_url"])
             if state.volume != 1.0 and hasattr(source, "volume"):
                 source.volume = state.volume
             loop = getattr(bot, "loop", None) or asyncio.get_running_loop()
