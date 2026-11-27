@@ -1363,8 +1363,17 @@ class RelayHub:
             "extension": self._meta,
         })
 
+    async def handle_auth_check(self, request: web.Request) -> web.Response:
+        if not self._authorized(request):
+            return web.json_response(
+                {"ok": False, "error": "unauthorized" if RELAY_SECRET else "relay_secret_missing"},
+                status=401 if RELAY_SECRET else 503,
+            )
+        return web.json_response({"ok": True, "relay_connected": self.is_connected})
+
     async def handle_ws(self, request: web.Request) -> web.StreamResponse:
         if not self._authorized(request):
+            logger.warning(f"Chrome relay rejected ({401 if RELAY_SECRET else 503})")
             return web.Response(status=401 if RELAY_SECRET else 503, text="unauthorized")
         ws = web.WebSocketResponse(max_msg_size=25 * 1024 * 1024, heartbeat=25.0)
         await ws.prepare(request)
@@ -2474,6 +2483,7 @@ async def _start_relay_server() -> Optional[web.AppRunner]:
         return None
     app = web.Application()
     app.router.add_get("/health", relay_hub.handle_health)
+    app.router.add_get("/relay/auth-check", relay_hub.handle_auth_check)
     app.router.add_get("/ws/relay", relay_hub.handle_ws)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -2483,15 +2493,6 @@ async def _start_relay_server() -> Optional[web.AppRunner]:
     return runner
 
 
-async def _main():
-    runner = await _start_relay_server()
-    try:
-        await bot.start(DISCORD_TOKEN)
-    finally:
-        if runner is not None:
-            await runner.cleanup()
-
-
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         logger.error("DISCORD_TOKEN not set")
@@ -2499,4 +2500,9 @@ if __name__ == "__main__":
     if not DATABASE_URL:
         logger.error("DATABASE_URL not set")
         exit(1)
-    asyncio.run(_main())
+    _relay_runner = bot.loop.run_until_complete(_start_relay_server())
+    try:
+        bot.run(DISCORD_TOKEN)
+    finally:
+        if _relay_runner is not None and not bot.loop.is_closed():
+            bot.loop.run_until_complete(_relay_runner.cleanup())

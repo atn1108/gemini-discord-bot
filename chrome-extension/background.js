@@ -1,3 +1,9 @@
+try {
+  importScripts("local_config.js");
+} catch {
+  // optional local hardcoded config (gitignored)
+}
+
 const EXT_VERSION = "1.0.0";
 const ENDPOINT_INIT = "https://gemini.google.com/app?hl=en";
 const ENDPOINT_BATCH = "https://gemini.google.com/_/BardChatUi/data/batchexecute";
@@ -76,15 +82,24 @@ async function ensureNetRules() {
   });
 }
 
+function normalizeToken(raw) {
+  let t = (raw || "").trim();
+  if (t.startsWith("token=")) t = t.slice(6).trim();
+  return t;
+}
+
 async function getConfig() {
+  const fallback = self.LOCAL_RELAY_CONFIG || {};
   const res = await chrome.storage.local.get({
-    wsUrl: "wss://gemini-discord-bot-production-f4e6267e.up.railway.app/ws/relay",
+    wsUrl: "",
     token: "",
-    tempChat: true,
+    tempChat: fallback.tempChat !== false,
   });
+  const wsUrl = (res.wsUrl || fallback.wsUrl || "wss://gemini-discord-bot-production-f4e6267e.up.railway.app/ws/relay").trim();
+  const token = normalizeToken(res.token || fallback.token || "");
   return {
-    wsUrl: (res.wsUrl || "").trim(),
-    token: (res.token || "").trim(),
+    wsUrl,
+    token,
     tempChat: res.tempChat !== false,
   };
 }
@@ -435,13 +450,35 @@ async function connectRelay(force = false) {
   }
 
   let targetUrl = cfg.wsUrl;
+  let authCheckUrl = "";
   try {
     const u = new URL(cfg.wsUrl);
     u.searchParams.set("token", cfg.token);
     targetUrl = u.toString();
+    const proto = u.protocol === "wss:" ? "https:" : "http:";
+    authCheckUrl = `${proto}//${u.host}/relay/auth-check?token=${encodeURIComponent(cfg.token)}`;
   } catch {
     setStatus({ connected: false, lastStatus: "WS URL không hợp lệ", lastError: cfg.wsUrl });
     return;
+  }
+
+  if (authCheckUrl) {
+    try {
+      const check = await fetch(authCheckUrl);
+      if (check.status === 401 || check.status === 503) {
+        const fallbackTok = normalizeToken(self.LOCAL_RELAY_CONFIG?.token || "");
+        if (check.status === 401 && fallbackTok && fallbackTok !== cfg.token) {
+          await chrome.storage.local.set({ token: fallbackTok });
+          setTimeout(() => connectRelay(true), 50);
+          return;
+        }
+        setStatus({ connected: false, lastStatus: `Từ chối kết nối (HTTP ${check.status})`, lastError: "Sai Relay Token hoặc server chưa đặt RELAY_SECRET" });
+        scheduleReconnect();
+        return;
+      }
+    } catch (e) {
+      // ignore precheck network error and still let WS attempt / report
+    }
   }
 
   setStatus({ connected: false, lastStatus: "Đang kết nối...", lastError: "" });
@@ -541,7 +578,7 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
     chrome.storage.local
       .set({
         wsUrl: (req.wsUrl || "").trim(),
-        token: (req.token || "").trim(),
+        token: normalizeToken(req.token),
         tempChat: req.tempChat !== false,
       })
       .then(() => connectRelay(true))

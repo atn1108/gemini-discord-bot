@@ -12,7 +12,8 @@
     "https://gemini.google.com/*",
     "https://lh3.googleusercontent.com/*",
     "https://work.fife.usercontent.google.com/*",
-    "https://*.googleusercontent.com/*"
+    "https://*.googleusercontent.com/*",
+    "https://*.up.railway.app/*"
   ],
   "background": {
     "service_worker": "background.js"
