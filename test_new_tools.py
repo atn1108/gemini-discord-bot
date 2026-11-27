@@ -222,6 +222,29 @@ async def main():
     buf.cleanup()
     check("BufferedAudioSource reads frames & EOF", len(frames) == 3 and buf._inner.cleaned, len(frames))
 
+    # 13. YTDLP_PROXY passed to YouTube extraction, skipped for scsearch
+    seen_opts = []
+    class FakeYDLProxy:
+        def __init__(self, opts):
+            seen_opts.append(opts)
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+        def extract_info(self, target, download=False):
+            return {"title": "OK", "url": "https://sc.example/a.mp3", "duration": 60}
+
+    old_proxy = b.YTDLP_PROXY
+    b.YTDLP_PROXY = "http://user:pass@home.example:8888"
+    try:
+        with patch.dict(sys.modules, {"yt_dlp": types.SimpleNamespace(YoutubeDL=FakeYDLProxy)}):
+            tr = b._extract_track_info("https://youtu.be/abc")
+            check("YTDLP_PROXY set for YouTube", seen_opts[-1].get("proxy") == b.YTDLP_PROXY and tr["proxy"] == b.YTDLP_PROXY)
+            tr2 = b._extract_track_info("scsearch5:test")
+            check("YTDLP_PROXY skipped for scsearch", "proxy" not in seen_opts[-1] and tr2["proxy"] == "")
+    finally:
+        b.YTDLP_PROXY = old_proxy
+
     print("\nALL NEW TOOLS PASSED")
 
 

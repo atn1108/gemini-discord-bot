@@ -101,6 +101,7 @@ MUSIC_QUEUE_MAX = int(os.getenv("MUSIC_QUEUE_MAX", "50"))
 YTDLP_COOKIES = os.getenv("YTDLP_COOKIES", "").strip()
 YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "").strip()
 YTDLP_PO_TOKEN = os.getenv("YTDLP_PO_TOKEN", "").strip()
+YTDLP_PROXY = os.getenv("YTDLP_PROXY", "").strip()
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash").strip()
 TTS_VOICE = os.getenv("TTS_VOICE", "vi-VN-HoaiMyNeural").strip()
 TTS_WEBHOOK_URL = os.getenv("TTS_WEBHOOK_URL", "").strip()
@@ -1144,6 +1145,9 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
         idx += 1
         try:
             run_opts = dict(base_opts)
+            use_proxy = bool(YTDLP_PROXY) and not target.startswith("scsearch")
+            if use_proxy:
+                run_opts["proxy"] = YTDLP_PROXY
             if target.startswith("scsearch"):
                 # Skip SoundCloud Go+ DRM tracks inside search results instead of aborting.
                 run_opts["ignoreerrors"] = True
@@ -1158,7 +1162,9 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
                     if "googlevideo.com" in info["url"]:
                         hdrs = dict(info.get("http_headers") or {})
                         hdrs["Range"] = "bytes=0-1"
-                        probe = httpx.get(info["url"], headers=hdrs, follow_redirects=True, timeout=8)
+                        proxy_kw = {"proxy": YTDLP_PROXY} if (use_proxy and YTDLP_PROXY.startswith("http")) else {}
+                        with httpx.Client(follow_redirects=True, timeout=8, **proxy_kw) as hc:
+                            probe = hc.get(info["url"], headers=hdrs)
                         if probe.status_code == 403:
                             raise ValueError(f"googlevideo returned 403 for {info.get('title') or target}")
                     break
@@ -1182,6 +1188,7 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
         "title": info.get("title") or q,
         "stream_url": info["url"],
         "http_headers": dict(info.get("http_headers") or {}),
+        "proxy": YTDLP_PROXY if use_proxy else "",
         "webpage_url": info.get("webpage_url") or (q if is_url else ""),
         "duration": info.get("duration") or 0,
     }
@@ -1250,12 +1257,17 @@ class BufferedAudioSource(discord.AudioSource):
             pass
 
 
-def _create_audio_source(stream_url: str, volume: float = 1.0, http_headers: Optional[Dict[str, str]] = None):
+def _create_audio_source(stream_url: str, volume: float = 1.0,
+                         http_headers: Optional[Dict[str, str]] = None,
+                         proxy: str = ""):
     is_hls = ".m3u8" in (stream_url or "").lower()
     is_http = (stream_url or "").startswith(("http://", "https://"))
     parts = []
     if is_http and not is_hls:
         parts.append("-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
+    if is_http and proxy and proxy.startswith("http"):
+        safe_proxy = proxy.replace('"', "")
+        parts.append(f'-http_proxy "{safe_proxy}"')
     if is_http and http_headers:
         ua = http_headers.get("User-Agent")
         if ua:
@@ -1315,7 +1327,11 @@ async def _play_next_track(guild: discord.Guild) -> None:
         state.current = nxt
         try:
             hdrs = nxt.get("http_headers")
-            source = _create_audio_source(nxt["stream_url"], http_headers=hdrs) if hdrs else _create_audio_source(nxt["stream_url"])
+            prx = nxt.get("proxy") or ""
+            if hdrs or prx:
+                source = _create_audio_source(nxt["stream_url"], http_headers=hdrs, proxy=prx)
+            else:
+                source = _create_audio_source(nxt["stream_url"])
             if state.volume != 1.0 and hasattr(source, "volume"):
                 source.volume = state.volume
             loop = getattr(bot, "loop", None) or asyncio.get_running_loop()
