@@ -1187,6 +1187,69 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
     }
 
 
+class BufferedAudioSource(discord.AudioSource):
+    """Pre-buffer PCM frames in a background thread so network jitter never stalls
+    py-cord's AudioPlayer (which would otherwise burst frames at 10x speed to catch up).
+    """
+
+    FRAME_BYTES = 3840  # 20ms @ 48kHz stereo 16-bit PCM
+
+    def __init__(self, inner: discord.AudioSource, max_frames: int = 150) -> None:
+        import queue
+        import threading
+
+        self._inner = inner
+        self._q: "queue.Queue[bytes]" = queue.Queue(maxsize=max_frames)
+        self._stop = threading.Event()
+        self._eof = threading.Event()
+        self._started = False
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def _reader(self) -> None:
+        try:
+            while not self._stop.is_set():
+                frame = self._inner.read()
+                if not frame:
+                    self._eof.set()
+                    break
+                while not self._stop.is_set():
+                    try:
+                        self._q.put(frame, timeout=0.2)
+                        break
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.debug(f"BufferedAudioSource reader stopped: {e}")
+            self._eof.set()
+
+    def read(self) -> bytes:
+        if not self._started:
+            self._started = True
+            # Brief pre-fill (up to ~0.25s) before first frame so initial TLS/probe delay
+            # never shifts AudioPlayer's wall-clock start time.
+            deadline = time.monotonic() + 1.5
+            while self._q.qsize() < 12 and not self._eof.is_set() and time.monotonic() < deadline:
+                time.sleep(0.02)
+        try:
+            return self._q.get_nowait()
+        except Exception:
+            if self._eof.is_set():
+                return b""
+            # Return 20ms silence instead of blocking AudioPlayer and triggering speedup burst.
+            return b"\x00" * self.FRAME_BYTES
+
+    def is_opus(self) -> bool:
+        return False
+
+    def cleanup(self) -> None:
+        self._stop.set()
+        try:
+            self._inner.cleanup()
+        except Exception:
+            pass
+
+
 def _create_audio_source(stream_url: str, volume: float = 1.0, http_headers: Optional[Dict[str, str]] = None):
     is_hls = ".m3u8" in (stream_url or "").lower()
     is_http = (stream_url or "").startswith(("http://", "https://"))
@@ -1204,7 +1267,8 @@ def _create_audio_source(stream_url: str, volume: float = 1.0, http_headers: Opt
         before_options=before,
         options="-vn",
     )
-    return discord.PCMVolumeTransformer(raw, volume=max(0.0, min(float(volume), 2.0)))
+    buffered = BufferedAudioSource(raw) if is_http else raw
+    return discord.PCMVolumeTransformer(buffered, volume=max(0.0, min(float(volume), 2.0)))
 
 
 def _tune_voice_encoder(vc) -> None:

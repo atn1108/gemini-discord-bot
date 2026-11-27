@@ -201,6 +201,27 @@ async def main():
     res = await b.execute_tool("music_control", {"action": "clear"}, guild, channel, caller, admin=False)
     check("queue clear", "Cleared 1" in res and len(st.queue) == 0, res)
 
+    # 12. BufferedAudioSource never blocks and drains cleanly
+    class FakeRaw(discord.AudioSource):
+        def __init__(self):
+            self.n = 0
+            self.cleaned = False
+        def read(self):
+            self.n += 1
+            return b"\x01" * 3840 if self.n <= 3 else b""
+        def cleanup(self):
+            self.cleaned = True
+
+    buf = b.BufferedAudioSource(FakeRaw())
+    frames = []
+    for _ in range(10):
+        f = buf.read()
+        if f == b"":
+            break
+        frames.append(f)
+    buf.cleanup()
+    check("BufferedAudioSource reads frames & EOF", len(frames) == 3 and buf._inner.cleaned, len(frames))
+
     print("\nALL NEW TOOLS PASSED")
 
 
