@@ -1191,8 +1191,6 @@ def _create_audio_source(stream_url: str, volume: float = 1.0, http_headers: Opt
     is_hls = ".m3u8" in (stream_url or "").lower()
     is_http = (stream_url or "").startswith(("http://", "https://"))
     parts = []
-    if is_http:
-        parts.append("-thread_queue_size 1024 -probesize 64k -analyzeduration 0")
     if is_http and not is_hls:
         parts.append("-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
     if is_http and http_headers:
