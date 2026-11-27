@@ -50,4 +50,11 @@ testBtn.addEventListener("click", () => {
   );
 });
 
+function refreshStatusOnly() {
+  chrome.runtime.sendMessage({ action: "get_status" }, (res) => {
+    if (res) renderStatus(res.state);
+  });
+}
+
 refresh();
+setInterval(refreshStatusOnly, 1500);

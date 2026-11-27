@@ -10,6 +10,7 @@ const ENDPOINT_BATCH = "https://gemini.google.com/_/BardChatUi/data/batchexecute
 const ENDPOINT_GENERATE = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
 
 let ws = null;
+let connectPromise = null;
 let pingTimer = null;
 let reconnectTimer = null;
 let reconnectDelayMs = 2000;
@@ -435,11 +436,24 @@ function scheduleReconnect() {
 }
 
 async function connectRelay(force = false) {
+  if (connectPromise) {
+    if (!force) return connectPromise;
+    await connectPromise.catch(() => {});
+  }
+  connectPromise = _connectRelayImpl(force).finally(() => {
+    connectPromise = null;
+  });
+  return connectPromise;
+}
+
+async function _connectRelayImpl(force = false) {
   if (force && ws) {
-    try {
-      ws.close();
-    } catch {}
+    const old = ws;
     ws = null;
+    stopPing();
+    try {
+      old.close(1000, "reconnect");
+    } catch {}
   }
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
@@ -486,12 +500,16 @@ async function connectRelay(force = false) {
   ws = sock;
 
   sock.onopen = () => {
+    if (ws !== sock) {
+      try { sock.close(1000, "superseded"); } catch {}
+      return;
+    }
     reconnectDelayMs = 2000;
     setStatus({ connected: true, lastStatus: "Đã kết nối bot", lastError: "" });
     sock.send(JSON.stringify({ type: "hello", version: EXT_VERSION, temp_chat: cfg.tempChat }));
     stopPing();
     pingTimer = setInterval(() => {
-      if (sock.readyState === WebSocket.OPEN) {
+      if (ws === sock && sock.readyState === WebSocket.OPEN) {
         sock.send(JSON.stringify({ type: "ping", ts: Date.now() }));
       }
     }, 20000);
@@ -539,12 +557,14 @@ async function connectRelay(force = false) {
   };
 
   sock.onerror = () => {
+    if (ws !== sock) return;
     setStatus({ connected: false, lastStatus: "Lỗi kết nối WS", lastError: "WebSocket error" });
   };
 
   sock.onclose = (evt) => {
+    if (ws !== sock) return;
     stopPing();
-    if (ws === sock) ws = null;
+    ws = null;
     setStatus({
       connected: false,
       lastStatus: `Mất kết nối (${evt.code || "closed"})`,
