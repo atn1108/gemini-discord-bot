@@ -102,6 +102,8 @@ YTDLP_COOKIES = os.getenv("YTDLP_COOKIES", "").strip()
 YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "").strip()
 YTDLP_PO_TOKEN = os.getenv("YTDLP_PO_TOKEN", "").strip()
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash").strip()
+TTS_VOICE = os.getenv("TTS_VOICE", "vi-VN-HoaiMyNeural").strip()
+TTS_WEBHOOK_URL = os.getenv("TTS_WEBHOOK_URL", "").strip()
 RESEARCH_TIMEOUT = int(os.getenv("RESEARCH_TIMEOUT", "300"))  # seconds, never hang
 RESEARCH_DEFAULT_SOURCES = int(os.getenv("RESEARCH_DEFAULT_SOURCES", "10"))
 # A message counts as a research request when it starts with one of these
@@ -134,7 +136,8 @@ Xưng "em" hoặc "bé", gọi các thành viên theo tên hiển thị (nếu c
 - Tối ưu độ dài: câu hỏi thường trả lời trong 1–4 câu; hướng dẫn kỹ thuật hoặc tổng hợp tin tức thì chia ý rõ ràng, đủ bước.
 
 # Tool Use (Công cụ server, nhạc, web, ảnh, tệp, skill)
-- Khi thành viên yêu cầu phát nhạc ("mở bài...", "bật nhạc...", "skip", "tạm dừng", "dừng nhạc", "xem hàng đợi", "chỉnh âm lượng", "rời voice"), gọi `play_music`, `music_control`, `set_volume` hoặc `leave_voice`.
+- Khi thành viên yêu cầu phát nhạc ("mở bài...", "bật nhạc...", "skip", "tạm dừng", "dừng nhạc", "xem hàng đợi", "chỉnh âm lượng", "vào voice", "rời voice"), gọi `play_music`, `music_control`, `set_volume`, `join_voice` hoặc `leave_voice`.
+- Khi thành viên nhờ nói trong voice ("nói câu...", "đọc lên voice"), gọi `speak`. Khi nhờ nghe trong voice hoặc bật trò chuyện giọng nói 2 chiều, gọi `listen_voice` hoặc `voice_chat`.
 - Khi thành viên nhờ đọc/giải thích ảnh hoặc meme trên kênh, gọi `read_image`.
 - Khi thành viên nhờ tạo bình chọn hoặc hẹn giờ nhắc kèo, gọi `create_poll` hoặc `create_reminder`.
 - Khi cần tra cứu ID role/thành viên trước khi thao tác, gọi `list_roles` / `list_members`.
@@ -948,6 +951,10 @@ TOOLS: List[Dict] = [
             "required": ["emoji"]}}},
     # Voice extras.
     {"type": "function", "function": {
+        "name": "join_voice",
+        "description": "Join the caller's current voice channel and stay there waiting.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
         "name": "leave_voice",
         "description": "Disconnect the bot from its current voice channel and clear the music queue.",
         "parameters": {"type": "object", "properties": {}}}},
@@ -957,6 +964,24 @@ TOOLS: List[Dict] = [
         "parameters": {"type": "object", "properties": {
             "volume": {"type": "integer", "description": "Volume percentage 0..200"}},
             "required": ["volume"]}}},
+    {"type": "function", "function": {
+        "name": "speak",
+        "description": "Speak text aloud in the caller's voice channel using TTS (stays in voice).",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string", "description": "Text to speak aloud in Vietnamese or English"}},
+            "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "listen_voice",
+        "description": "Listen to people speaking in the voice channel for N seconds, transcribe (STT), and reply.",
+        "parameters": {"type": "object", "properties": {
+            "seconds": {"type": "integer", "description": "Seconds to listen (3-20, default 8)"},
+            "reply_in_voice": {"type": "boolean", "description": "Whether to speak the reply aloud via TTS (default true)"}}}}},
+    {"type": "function", "function": {
+        "name": "voice_chat",
+        "description": "Turn continuous hands-free voice listening/replying (STT+TTS) on or off in the voice channel.",
+        "parameters": {"type": "object", "properties": {
+            "enabled": {"type": "boolean", "description": "true to start listening continuously, false to stop"}},
+            "required": ["enabled"]}}},
     # Utilities: Poll, Reminder, Image reading.
     {"type": "function", "function": {
         "name": "create_poll",
@@ -1163,21 +1188,40 @@ async def _play_next_track(guild: discord.Guild) -> None:
             asyncio.create_task(_play_next_track(guild))
 
 
+async def _ensure_voice(guild: discord.Guild, caller: Optional[discord.Member]):
+    """Connect to (or move to) the caller's voice channel and verify connection."""
+    voice_state = getattr(caller, "voice", None)
+    voice_ch = getattr(voice_state, "channel", None)
+    if voice_ch is None:
+        return None, "ERROR: Caller is not in a voice channel. Ask them to join a voice channel first."
+
+    vc = getattr(guild, "voice_client", None)
+    if vc is not None and not getattr(vc, "is_connected", lambda: True)():
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+        vc = None
+
+    if vc is None:
+        vc = await voice_ch.connect()
+    elif getattr(vc, "channel", None) != voice_ch:
+        await vc.move_to(voice_ch)
+
+    if vc is None or not getattr(vc, "is_connected", lambda: True)():
+        return None, "ERROR: Could not establish voice connection."
+    return vc, ""
+
+
 async def _handle_play_music(guild: discord.Guild, caller: Optional[discord.Member],
                              query: str) -> str:
     query = (query or "").strip()
     if not query:
         return "ERROR: missing song name or URL"
-    voice_state = getattr(caller, "voice", None)
-    voice_ch = getattr(voice_state, "channel", None)
-    if voice_ch is None:
-        return "ERROR: Caller is not in a voice channel. Ask them to join a voice channel first."
-
-    vc = getattr(guild, "voice_client", None)
+    vc, err = await _ensure_voice(guild, caller)
     if vc is None:
-        vc = await voice_ch.connect()
-    elif getattr(vc, "channel", None) != voice_ch:
-        await vc.move_to(voice_ch)
+        return err
+    voice_ch = vc.channel
 
     track = await asyncio.to_thread(_extract_track_info, query)
     track["requester"] = getattr(caller, "display_name", "?")
@@ -1239,6 +1283,9 @@ async def _handle_music_control(guild: discord.Guild, action: str) -> str:
 
 
 async def _handle_leave_voice(guild: discord.Guild) -> str:
+    old = voice_chat_tasks.pop(guild.id, None)
+    if old is not None and not old.done():
+        old.cancel()
     state = music_states[guild.id]
     state.queue.clear()
     state.current = None
@@ -1264,6 +1311,263 @@ async def _handle_set_volume(guild: discord.Guild, volume_pct: Any) -> str:
     if src is not None and hasattr(src, "volume"):
         src.volume = state.volume
     return f"Set music volume to {pct}%."
+
+
+# ===== VOICE TTS & STT (Kokoro-VI / Edge-TTS + Gemini Audio) =====
+voice_chat_tasks: Dict[int, asyncio.Task] = {}
+
+
+def _clean_tts_text(text: str) -> str:
+    s = re.sub(r"https?://\S+", "", text or "")
+    s = re.sub(r"<[@#][!&]?\d+>", "", s)
+    s = re.sub(r"[`*_~>|#]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:600]
+
+
+async def _synthesize_tts(text: str) -> tuple[Optional[str], str]:
+    """Generate a temporary audio file for TTS via TTS_WEBHOOK_URL (kokoro-vi) or edge-tts."""
+    import tempfile
+    clean = _clean_tts_text(text)
+    if not clean:
+        return None, "empty text"
+
+    if TTS_WEBHOOK_URL:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(TTS_WEBHOOK_URL, json={"text": clean})
+            if r.status_code == 200 and r.content:
+                ext = ".wav" if "wav" in (r.headers.get("content-type") or "").lower() else ".mp3"
+                fd, path = tempfile.mkstemp(prefix="tts_", suffix=ext)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(r.content)
+                return path, ""
+        except Exception as e:
+            logger.warning(f"TTS_WEBHOOK_URL failed, falling back to edge-tts: {e}")
+
+    try:
+        import edge_tts
+        fd, path = tempfile.mkstemp(prefix="tts_", suffix=".mp3")
+        os.close(fd)
+        comm = edge_tts.Communicate(clean, TTS_VOICE)
+        await comm.save(path)
+        if os.path.getsize(path) > 0:
+            return path, ""
+        return None, "edge-tts produced empty audio"
+    except Exception as e:
+        return None, str(e)
+
+
+async def _speak_in_voice(guild: discord.Guild, caller: Optional[discord.Member], text: str) -> str:
+    vc, err = await _ensure_voice(guild, caller) if caller is not None else (getattr(guild, "voice_client", None), "")
+    if vc is None:
+        return err or "ERROR: Bot is not in a voice channel."
+
+    path, tts_err = await _synthesize_tts(text)
+    if not path:
+        return f"ERROR: TTS failed ({tts_err})"
+
+    state = music_states[guild.id]
+    if vc.is_playing() or vc.is_paused():
+        vc.stop()
+
+    done_evt = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    src = discord.PCMVolumeTransformer(
+        discord.FFmpegPCMAudio(path, options="-vn"),
+        volume=state.volume,
+    )
+
+    def _after(_err):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        loop.call_soon_threadsafe(done_evt.set)
+
+    vc.play(src, after=_after)
+    try:
+        await asyncio.wait_for(done_evt.wait(), timeout=60)
+    except asyncio.TimeoutError:
+        pass
+    return f"Spoke in #{getattr(vc.channel, 'name', 'voice')}: {_clean_tts_text(text)[:100]}"
+
+
+def _has_speech(wav_bytes: bytes, min_rms: int = 250) -> bool:
+    """Fast PCM16 WAV energy check so silent chunks never hit the STT API."""
+    if not wav_bytes or len(wav_bytes) <= 46:
+        return False
+    pcm = wav_bytes[44:]
+    if len(pcm) % 2:
+        pcm = pcm[:-1]
+    try:
+        import numpy as np
+        samples = np.frombuffer(pcm, dtype=np.int16)
+        if samples.size == 0:
+            return False
+        rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+        return rms >= min_rms
+    except Exception:
+        import struct
+        step = max(1, (len(pcm) // 2) // 2000)
+        vals = [s[0] for s in struct.iter_unpack("<h", pcm)][::step]
+        if not vals:
+            return False
+        rms = (sum(v * v for v in vals) / len(vals)) ** 0.5
+        return rms >= min_rms
+
+
+async def _transcribe_wav(wav_bytes: bytes) -> str:
+    if not GEMINI_API_KEY:
+        return ""
+    b64 = base64.b64encode(wav_bytes).decode("ascii")
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_VISION_MODEL}:generateContent"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                endpoint,
+                headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                json={
+                    "contents": [{
+                        "parts": [
+                            {"text": "Chép chính xác lời nói trong đoạn audio này. Chỉ trả về câu nói; nếu chỉ là tiếng ồn hoặc im lặng thì trả về rỗng."},
+                            {"inline_data": {"mime_type": "audio/wav", "data": b64}},
+                        ]
+                    }]
+                },
+            )
+        if r.status_code == 200:
+            cands = r.json().get("candidates") or []
+            parts = ((cands[0].get("content") or {}).get("parts") or []) if cands else []
+            return " ".join(p.get("text", "") for p in parts if p.get("text")).strip()
+    except Exception as e:
+        logger.warning(f"STT transcribe failed: {e}")
+    return ""
+
+
+async def _record_voice_once(vc, seconds: int = 8) -> Dict[int, bytes]:
+    """Record audio per-user from Discord VoiceClient using WaveSink."""
+    if not hasattr(discord, "sinks"):
+        return {}
+    done_evt = asyncio.Event()
+    recorded: Dict[int, bytes] = {}
+    loop = asyncio.get_running_loop()
+
+    async def _finished_cb(sink, *_args):
+        for uid, audio in (getattr(sink, "audio_data", {}) or {}).items():
+            try:
+                audio.file.seek(0)
+                recorded[int(uid)] = audio.file.read()
+            except Exception:
+                pass
+        loop.call_soon_threadsafe(done_evt.set)
+
+    sink = discord.sinks.WaveSink()
+    vc.start_recording(sink, _finished_cb)
+    await asyncio.sleep(max(3, min(int(seconds), 20)))
+    try:
+        vc.stop_recording()
+    except Exception:
+        pass
+    try:
+        await asyncio.wait_for(done_evt.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        pass
+    return recorded
+
+
+async def _handle_listen_voice(guild: discord.Guild, channel, caller: Optional[discord.Member],
+                               seconds: int = 8, reply_in_voice: bool = True,
+                               require_keyword: bool = False) -> str:
+    if not GEMINI_API_KEY:
+        return "ERROR: GEMINI_API_KEY is required for voice STT."
+    vc = getattr(guild, "voice_client", None)
+    if vc is None and caller is not None:
+        vc, err = await _ensure_voice(guild, caller)
+        if vc is None:
+            return err
+    if vc is None or not getattr(vc, "is_connected", lambda: True)():
+        return "ERROR: Bot is not in a voice channel."
+    if getattr(vc, "recording", False):
+        return "Already recording in this voice channel."
+
+    clips = await _record_voice_once(vc, seconds=seconds)
+    transcripts = []
+    for uid, wav in clips.items():
+        if not _has_speech(wav):
+            continue
+        text = await _transcribe_wav(wav)
+        if not text:
+            continue
+        member = guild.get_member(uid) or await resolve_member(guild, str(uid))
+        who = getattr(member, "display_name", str(uid))
+        transcripts.append((who, text, member))
+
+    if not transcripts:
+        return "Không nghe thấy ai nói gì trong kênh thoại."
+
+    summary_lines = [f"🎙️ **{who}:** {txt}" for who, txt, _ in transcripts]
+    if channel is not None and hasattr(channel, "send"):
+        await channel.send("\n".join(summary_lines)[:1900])
+
+    if not reply_in_voice:
+        return "\n".join(summary_lines)
+
+    combined = "\n".join(f"[{who}]: {txt}" for who, txt, _ in transcripts)
+    if require_keyword and not any(kw in combined.lower() for kw in KEYWORDS):
+        return "\n".join(summary_lines)
+
+    hist = await get_history(channel.id) if channel is not None else []
+    hist.append({"role": "user", "content": combined})
+    ok, res = await run_tool_loop(
+        hist,
+        channel.id if channel is not None else guild.id,
+        guild=guild,
+        channel=channel,
+        caller=transcripts[0][2] or caller,
+    )
+    if ok:
+        ans = (res.get("answer") or "").strip()
+        if ans:
+            if channel is not None:
+                await persist_turn(channel.id, hist, ans)
+                if hasattr(channel, "send"):
+                    for chunk in chunk_text(ans, 1990):
+                        await channel.send(chunk)
+            await _speak_in_voice(guild, None, ans)
+            return f"Heard & replied in voice: {ans[:120]}"
+    return "\n".join(summary_lines)
+
+
+async def _voice_chat_loop(guild: discord.Guild, channel, caller: Optional[discord.Member]) -> None:
+    try:
+        while not bot.is_closed():
+            vc = getattr(guild, "voice_client", None)
+            if vc is None or not getattr(vc, "is_connected", lambda: False)():
+                break
+            if not vc.is_playing() and not vc.is_paused() and not getattr(vc, "recording", False):
+                await _handle_listen_voice(
+                    guild, channel, caller,
+                    seconds=6, reply_in_voice=True, require_keyword=True,
+                )
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        voice_chat_tasks.pop(guild.id, None)
+
+
+async def _handle_voice_chat(guild: discord.Guild, channel, caller: Optional[discord.Member], enabled: bool) -> str:
+    old = voice_chat_tasks.pop(guild.id, None)
+    if old is not None and not old.done():
+        old.cancel()
+    if not enabled:
+        return "Turned off continuous voice chat (STT+TTS)."
+    vc, err = await _ensure_voice(guild, caller)
+    if vc is None:
+        return err
+    voice_chat_tasks[guild.id] = asyncio.create_task(_voice_chat_loop(guild, channel, caller))
+    return f"Started continuous voice chat in #{getattr(vc.channel, 'name', 'voice')}. Say '{KEYWORDS[0]} ...' to talk to me!"
 
 
 # ===== WEB SEARCH & URL FETCH =====
@@ -2539,11 +2843,30 @@ async def execute_tool(name: str, args: Dict, guild: discord.Guild,
             await msg.add_reaction(emoji)
             return f"Reacted {emoji} on message {msg.id}."
 
+        if name == "join_voice":
+            vc, err = await _ensure_voice(guild, caller)
+            if vc is None:
+                return err
+            return f"Joined voice channel #{getattr(vc.channel, 'name', 'voice')} and waiting."
+
         if name == "leave_voice":
             return await _handle_leave_voice(guild)
 
         if name == "set_volume":
             return await _handle_set_volume(guild, args.get("volume"))
+
+        if name == "speak":
+            return await _speak_in_voice(guild, caller, args.get("text") or "")
+
+        if name == "listen_voice":
+            return await _handle_listen_voice(
+                guild, channel, caller,
+                seconds=int(args.get("seconds") or 8),
+                reply_in_voice=bool(args.get("reply_in_voice", True)),
+            )
+
+        if name == "voice_chat":
+            return await _handle_voice_chat(guild, channel, caller, bool(args.get("enabled", True)))
 
         if name == "create_poll":
             return await _handle_create_poll(channel, args)
@@ -3232,6 +3555,27 @@ async def skill_remove_cmd(ctx, name: str):
         await ctx.respond(f"🗑️ Đã xóa skill **`{_clean_skill_name(name)}`**.")
     else:
         await ctx.respond(f"❌ Không tìm thấy skill `{name}` trong database.", ephemeral=True)
+
+@bot.slash_command(name="say", description="Cho bé vào kênh thoại nói một câu (TTS)")
+async def say_cmd(ctx, text: str):
+    await ctx.defer(ephemeral=True)
+    res = await _speak_in_voice(ctx.guild, ctx.author, text)
+    await ctx.followup.send(f"🔊 {res}", ephemeral=True)
+
+
+@bot.slash_command(name="listen", description="Bé nghe kênh thoại vài giây (STT) rồi trả lời")
+async def listen_cmd(ctx, seconds: int = 8):
+    await ctx.defer()
+    res = await _handle_listen_voice(ctx.guild, ctx.channel, ctx.author, seconds=seconds, reply_in_voice=True)
+    await ctx.followup.send(f"🎙️ {res[:1900]}")
+
+
+@bot.slash_command(name="voice_chat", description="Bật/tắt chế độ nghe nói tự động 2 chiều trong kênh thoại")
+async def voice_chat_cmd(ctx, enabled: bool = True):
+    await ctx.defer()
+    res = await _handle_voice_chat(ctx.guild, ctx.channel, ctx.author, enabled)
+    await ctx.followup.send(f"🎧 {res}")
+
 
 # ===== STARTUP =====
 @bot.listen()

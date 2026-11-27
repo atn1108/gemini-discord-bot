@@ -146,6 +146,25 @@ async def main():
         b.GEMINI_API_KEY = old_key
         check("read_image", res == "Ảnh con mèo", res)
 
+    # 9. Voice stay + TTS + STT helpers
+    check("_has_speech silent", not b._has_speech(b"RIFF" + b"\x00" * 100))
+    loud_pcm = b"\x00\x20" * 500
+    check("_has_speech loud", b._has_speech(b"RIFF" + b"\x00" * 40 + loud_pcm))
+
+    fake_vc = MagicMock(channel=MagicMock(id=777))
+    fake_vc.channel.name = "Sảnh"
+    fake_vc.is_connected = lambda: True
+    fake_vc.is_playing = lambda: False
+    fake_vc.is_paused = lambda: False
+    fake_vc.recording = False
+    with patch.object(b, "_ensure_voice", AsyncMock(return_value=(fake_vc, ""))):
+        res = await b.execute_tool("join_voice", {}, guild, channel, caller, admin=False)
+        check("join_voice", "Joined voice channel #Sảnh" in res, res)
+
+    with patch.object(b, "_speak_in_voice", AsyncMock(return_value="Spoke in #Sảnh: alo")):
+        res = await b.execute_tool("speak", {"text": "alo"}, guild, channel, caller, admin=False)
+        check("speak", "Spoke in #Sảnh" in res, res)
+
     print("\nALL NEW TOOLS PASSED")
 
 
