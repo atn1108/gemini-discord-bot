@@ -1143,7 +1143,11 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
         target = targets[idx]
         idx += 1
         try:
-            with yt_dlp.YoutubeDL(base_opts) as ydl:
+            run_opts = dict(base_opts)
+            if target.startswith("scsearch"):
+                # Skip SoundCloud Go+ DRM tracks inside search results instead of aborting.
+                run_opts["ignoreerrors"] = True
+            with yt_dlp.YoutubeDL(run_opts) as ydl:
                 info = ydl.extract_info(target, download=False)
             if info:
                 if "entries" in info:
@@ -1169,7 +1173,7 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
                 if yt_title:
                     clean_title = _clean_track_query(yt_title) or yt_title
                     expected_title = clean_title
-                    targets.append(f"scsearch3:{clean_title}")
+                    targets.append(f"scsearch5:{clean_title}")
 
     if not info or not info.get("url"):
         raise ValueError(str(last_err) if last_err else "No playable audio stream URL returned")
@@ -1188,7 +1192,7 @@ def _create_audio_source(stream_url: str, volume: float = 1.0, http_headers: Opt
     is_http = (stream_url or "").startswith(("http://", "https://"))
     parts = []
     if is_http:
-        parts.append("-thread_queue_size 1024")
+        parts.append("-thread_queue_size 1024 -probesize 64k -analyzeduration 0")
     if is_http and not is_hls:
         parts.append("-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
     if is_http and http_headers:
