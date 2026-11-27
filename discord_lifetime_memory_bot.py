@@ -21,6 +21,13 @@ from typing import List, Dict, Optional, Any
 import time
 from aiohttp import web
 
+try:  # load .env.local / .env for local runs without overriding container env
+    from dotenv import load_dotenv
+    load_dotenv(".env.local", override=False)
+    load_dotenv(".env", override=False)
+except Exception:  # pragma: no cover
+    pass
+
 try:  # optional dependency-free enough module that lives next to this file
     from gemini_wm import remove_watermark as _gemini_wm_remove
 except Exception:  # pragma: no cover - bot must still boot without it
@@ -147,7 +154,13 @@ channel_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 async def init_db():
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        max_inactive_connection_lifetime=60,
+        statement_cache_size=0,
+    )
     async with pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS conversations (

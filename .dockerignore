@@ -3,6 +3,8 @@ __pycache__
 *.pyo
 .git
 .env
+.env.local
+.neon
 *.log
 .venv
 venv
