@@ -105,6 +105,8 @@ YTDLP_PROXY = os.getenv("YTDLP_PROXY", "").strip()
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash").strip()
 TTS_VOICE = os.getenv("TTS_VOICE", "vi-VN-HoaiMyNeural").strip()
 TTS_WEBHOOK_URL = os.getenv("TTS_WEBHOOK_URL", "").strip()
+CAPCUT_TTS_ENABLED = os.getenv("CAPCUT_TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+CAPCUT_TTS_VOICE = os.getenv("CAPCUT_TTS_VOICE", "BV074_streaming").strip()
 RESEARCH_TIMEOUT = int(os.getenv("RESEARCH_TIMEOUT", "300"))  # seconds, never hang
 RESEARCH_DEFAULT_SOURCES = int(os.getenv("RESEARCH_DEFAULT_SOURCES", "10"))
 # A message counts as a research request when it starts with one of these
@@ -1526,8 +1528,85 @@ def _clean_tts_text(text: str) -> str:
     return s[:600]
 
 
-async def _synthesize_tts(text: str) -> tuple[Optional[str], str]:
-    """Generate a temporary audio file for TTS via TTS_WEBHOOK_URL (kokoro-vi) or edge-tts."""
+def _extract_capcut_audio_url(obj: Any) -> Optional[str]:
+    hits: List[str] = []
+
+    def walk(x: Any) -> None:
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if isinstance(v, str):
+                    if "url" in k.lower() and v.startswith("http"):
+                        hits.append(v)
+                    elif v[:1] in "[{":
+                        try:
+                            walk(json.loads(v))
+                        except Exception:
+                            pass
+                else:
+                    walk(v)
+        elif isinstance(x, list):
+            for item in x:
+                walk(item)
+
+    walk(obj)
+    for u in hits:
+        if re.search(r"\.(mp3|m4a|wav|aac)(?:$|\?)", u, re.I) or "tos-" in u.lower() or "tiktokcdn" in u.lower():
+            return u
+    return hits[0] if hits else None
+
+
+def _synthesize_capcut_tts_sync(text: str, voice: str = "") -> Optional[bytes]:
+    """Synthesize speech via CapCut cloud API (chunked at 200 chars, returns mp3 bytes)."""
+    from capcut_tts_api import CapCutClient
+    v = (voice or CAPCUT_TTS_VOICE or "BV074_streaming").strip()
+    client = CapCutClient()
+    # CapCut limits single task to 200 chars; split at sentence/word boundaries.
+    chunks: List[str] = []
+    cur = ""
+    for piece in re.split(r"(?<=[.!?…])\s+", text):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if len(cur) + len(piece) + 1 <= 190:
+            cur = f"{cur} {piece}".strip()
+        else:
+            if cur:
+                chunks.append(cur)
+            cur = piece[:190]
+    if cur:
+        chunks.append(cur)
+    if not chunks:
+        return None
+
+    parts: List[bytes] = []
+    for chunk in chunks:
+        res = client.create_tts_task(texts=chunk, voice=v, rate="1.0")
+        task = ((res.get("data") or {}).get("tasks") or [{}])[0]
+        tid, tok = task.get("id"), task.get("token")
+        if not tid or not tok:
+            raise RuntimeError(f"CapCut create_tts_task failed: {res}")
+        deadline = time.monotonic() + 25.0
+        audio_url = None
+        while time.monotonic() < deadline:
+            q = client.query_tts_task(tid, tok)
+            qt = ((q.get("data") or {}).get("tasks") or [{}])[0]
+            st = qt.get("status")
+            if st in ("succeed", "success"):
+                audio_url = _extract_capcut_audio_url(q)
+                break
+            if st == "failed":
+                raise RuntimeError(f"CapCut TTS task failed: {qt}")
+            time.sleep(0.35)
+        if not audio_url:
+            raise TimeoutError("CapCut TTS timed out")
+        r = httpx.get(audio_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        r.raise_for_status()
+        parts.append(r.content)
+    return b"".join(parts)
+
+
+async def _synthesize_tts(text: str, voice: str = "") -> tuple[Optional[str], str]:
+    """Generate a temporary audio file for TTS via TTS_WEBHOOK_URL, CapCut TTS, or edge-tts."""
     import tempfile
     clean = _clean_tts_text(text)
     if not clean:
@@ -1544,7 +1623,18 @@ async def _synthesize_tts(text: str) -> tuple[Optional[str], str]:
                     f.write(r.content)
                 return path, ""
         except Exception as e:
-            logger.warning(f"TTS_WEBHOOK_URL failed, falling back to edge-tts: {e}")
+            logger.warning(f"TTS_WEBHOOK_URL failed, falling back: {e}")
+
+    if CAPCUT_TTS_ENABLED:
+        try:
+            raw = await asyncio.to_thread(_synthesize_capcut_tts_sync, clean, voice)
+            if raw:
+                fd, path = tempfile.mkstemp(prefix="tts_cc_", suffix=".mp3")
+                with os.fdopen(fd, "wb") as f:
+                    f.write(raw)
+                return path, ""
+        except Exception as e:
+            logger.warning(f"CapCut TTS failed, falling back to edge-tts: {e}")
 
     try:
         import edge_tts

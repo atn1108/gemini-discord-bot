@@ -245,6 +245,10 @@ async def main():
     finally:
         b.YTDLP_PROXY = old_proxy
 
+    # 14. CapCut TTS URL extraction
+    sample_resp = {"data": {"tasks": [{"status": "succeed", "result": '{"audio_url": "https://cdn.example/tts.mp3"}'}]}}
+    check("capcut url extract", b._extract_capcut_audio_url(sample_resp) == "https://cdn.example/tts.mp3")
+
     print("\nALL NEW TOOLS PASSED")
 
 

@@ -16,5 +16,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY discord_lifetime_memory_bot.py .
 COPY gemini_wm.py .
+COPY capcut_tts_api ./capcut_tts_api
 COPY skills ./skills
 CMD ["python", "discord_lifetime_memory_bot.py"]
