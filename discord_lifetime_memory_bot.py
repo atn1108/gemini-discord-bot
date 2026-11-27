@@ -1454,6 +1454,7 @@ async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "")
     full_prompt = f"{prompt} (aspect ratio {aspect_ratio.strip()})" if aspect_ratio.strip() else prompt
 
     # 0. Chrome extension relay running on user's PC (same IP + full cookie jar).
+    relay_err = ""
     if relay_hub.is_connected:
         relay_raw, relay_ext, relay_err = await relay_hub.generate_image(
             full_prompt, aspect_ratio, timeout=IMAGE_GEN_TIMEOUT
@@ -1522,7 +1523,8 @@ async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "")
                 return f"Generated and sent image via Pollinations fallback to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
 
         if not url:
-            return f"ERROR: image generator unavailable ({poly_err or 'no image returned'})"
+            detail = f"relay: {relay_err}" if relay_err else (poly_err or "no image returned")
+            return f"ERROR: image generator unavailable ({detail})"
         if IMAGE_DEFAULT_ONLY:
             return (f"IMAGE_FETCH_BLOCKED: Default Gemini Web generated the image at {url} "
                     f"but Google CDN returned HTTP 403 when fetching bytes (fallback is currently disabled via IMAGE_DEFAULT_ONLY).")

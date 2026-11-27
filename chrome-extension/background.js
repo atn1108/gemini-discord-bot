@@ -76,7 +76,7 @@ async function ensureNetRules() {
       },
     },
   ];
-  await chrome.declarativeNetRequest.updateDynamicRules({
+  await chrome.declarativeNetRequest.updateSessionRules({
     removeRuleIds: [1, 2, 3],
     addRules: rules,
   });
