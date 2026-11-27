@@ -95,7 +95,7 @@ check("format failed -> error msg", "quota exceeded" in fail_text and fail_md ==
 # 7. Webhook payload carries the system prompt (persona + remembered facts)
 import inspect
 src = inspect.getsource(bot_mod.call_webhook)
-check("call_webhook sends system", '"system": await build_system_prompt()' in src)
+check("call_webhook sends system", "system_prompt = await build_system_prompt()" in src and '"system": system_prompt' in src)
 check("call_webhook builds prompt", "build_system_prompt" in src)
 
 # 8. Timeout guards

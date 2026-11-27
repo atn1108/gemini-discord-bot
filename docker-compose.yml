@@ -1,20 +1,18 @@
-# docker-compose.yml — chạy toàn bộ stack trên VPS / GCP e2-micro / máy cá nhân
-# Lệnh: docker compose up -d
+# docker-compose.yml — chạy bot trên VPS / GCP e2-micro / máy cá nhân
+# Lệnh chạy bot standalone (dùng gemini-web-to-api hiện tại hoặc tự host):
+#   docker compose up -d
 #
-# Service được gộp:
-#   - gemini-discord-bot  : bot chính (đã tích hợp relay + forwarder)
-#   - gemini-web-to-api   : Gemini Web proxy (chat + image + deep research)
+# Lệnh chạy kèm container gemini-web-to-api (khi đã clone ../gemini-web-to-api):
+#   docker compose --profile with-proxy up -d
 #
 # Cần tạo file .env trước khi chạy (xem .env.example)
 
-version: "3.9"
-
 services:
-  # ── 1. Gemini Web-to-API proxy ───────────────────────────────────────────
+  # ── 1. Gemini Web-to-API proxy (tùy chọn, bật bằng --profile with-proxy) ──
   gemini-web-to-api:
-    image: ghcr.io/your-org/gemini-web-to-api:latest   # thay bằng image của mày
+    profiles: ["with-proxy"]
     build:
-      context: ../gemini-web-to-api                     # hoặc dùng image có sẵn
+      context: ../gemini-web-to-api
     restart: unless-stopped
     environment:
       - GEMINI_COOKIES=${GEMINI_COOKIES}
@@ -24,7 +22,7 @@ services:
       - RATE_LIMIT_MAX_REQUESTS=${RATE_LIMIT_MAX_REQUESTS:-20}
       - RATE_LIMIT_WINDOW_MS=${RATE_LIMIT_WINDOW_MS:-60000}
     ports:
-      - "3000:3000"       # expose ra ngoài nếu cần debug; bỏ dòng này khi prod
+      - "3000:3000"
     networks:
       - bot-net
     healthcheck:
@@ -39,9 +37,6 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
-    depends_on:
-      gemini-web-to-api:
-        condition: service_healthy
     environment:
       # Discord
       - DISCORD_TOKEN=${DISCORD_TOKEN}
@@ -53,10 +48,10 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - GEMINI_IMAGE_MODEL=${GEMINI_IMAGE_MODEL:-gemini-2.5-flash-image}
       - GEMINI_COOKIES=${GEMINI_COOKIES:-}
-      # Trỏ thẳng vào gemini-web-to-api (nội bộ docker network, không qua internet)
-      - GEMINI_CHAT_URL=http://gemini-web-to-api:3000/openai/v1/chat/completions
-      - DEEP_RESEARCH_URL=http://gemini-web-to-api:3000/gemini/v1beta/deepresearch
-      - IMAGE_GEN_URL=http://gemini-web-to-api:3000/openai/v1/images/generations
+      # Mặc định trỏ thẳng về gemini-web-to-api; nếu dùng --profile with-proxy thì set http://gemini-web-to-api:3000/... trong .env
+      - GEMINI_CHAT_URL=${GEMINI_CHAT_URL:-https://gemini-web-to-api-production.up.railway.app/openai/v1/chat/completions}
+      - DEEP_RESEARCH_URL=${DEEP_RESEARCH_URL:-https://gemini-web-to-api-production.up.railway.app/gemini/v1beta/deepresearch}
+      - IMAGE_GEN_URL=${IMAGE_GEN_URL:-https://gemini-web-to-api-production.up.railway.app/openai/v1/images/generations}
       # Bỏ WEBHOOK_URL → gọi thẳng, không qua forwarder
       - WEBHOOK_URL=
       # Relay (Chrome extension kết nối vào đây)

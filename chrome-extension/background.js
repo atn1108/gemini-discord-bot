@@ -573,6 +573,8 @@ async function _connectRelayImpl(force = false) {
       connected: false,
       lastStatus: `Mất kết nối (${evt.code || "closed"})`,
     });
+    // Don't fight a newer socket that intentionally replaced this one.
+    if (evt.reason === "replaced" || evt.reason === "superseded") return;
     scheduleReconnect();
   };
 }
@@ -580,20 +582,19 @@ async function _connectRelayImpl(force = false) {
 chrome.runtime.onInstalled.addListener(() => {
   ensureNetRules().catch(() => {});
   chrome.alarms.create("relay-keepalive", { periodInMinutes: 0.5 });
-  chrome.alarms.create("relay-keepalive", { periodInMinutes: 0.5 });
-connectRelay();
+  connectRelay();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   ensureNetRules().catch(() => {});
   chrome.alarms.create("relay-keepalive", { periodInMinutes: 0.5 });
-  chrome.alarms.create("relay-keepalive", { periodInMinutes: 0.5 });
-connectRelay();
+  connectRelay();
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "relay-keepalive" || alarm.name === "relay-reconnect") chrome.alarms.create("relay-keepalive", { periodInMinutes: 0.5 });
-connectRelay();
+  if (alarm.name === "relay-keepalive" || alarm.name === "relay-reconnect") {
+    connectRelay();
+  }
 });
 
 chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
