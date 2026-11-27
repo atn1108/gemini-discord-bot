@@ -3785,6 +3785,26 @@ async def _start_relay_server() -> Optional[web.AppRunner]:
     return runner
 
 
+def _start_pot_server():
+    """Start local bgutil-ytdlp-pot-provider Node server on 127.0.0.1:4416 if installed."""
+    entry = "/opt/bgutil-pot/server/build/main.js"
+    if not os.path.exists(entry):
+        return None
+    import subprocess
+    try:
+        proc = subprocess.Popen(
+            ["node", entry, "--host", "127.0.0.1"],
+            cwd="/opt/bgutil-pot/server",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        logger.info(f"Started bgutil PO Token server (pid={proc.pid})")
+        return proc
+    except Exception as e:
+        logger.warning(f"Failed to start bgutil PO Token server: {e}")
+        return None
+
+
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         logger.error("DISCORD_TOKEN not set")
@@ -3792,9 +3812,12 @@ if __name__ == "__main__":
     if not DATABASE_URL:
         logger.error("DATABASE_URL not set")
         exit(1)
+    _pot_proc = _start_pot_server()
     _relay_runner = bot.loop.run_until_complete(_start_relay_server())
     try:
         bot.run(DISCORD_TOKEN)
     finally:
+        if _pot_proc is not None and _pot_proc.poll() is None:
+            _pot_proc.terminate()
         if _relay_runner is not None and not bot.loop.is_closed():
             bot.loop.run_until_complete(_relay_runner.cleanup())
