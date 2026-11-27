@@ -1585,7 +1585,7 @@ def _synthesize_capcut_tts_sync(text: str, voice: str = "") -> Optional[bytes]:
         tid, tok = task.get("id"), task.get("token")
         if not tid or not tok:
             raise RuntimeError(f"CapCut create_tts_task failed: {res}")
-        deadline = time.monotonic() + 25.0
+        deadline = time.monotonic() + 90.0
         audio_url = None
         while time.monotonic() < deadline:
             q = client.query_tts_task(tid, tok)
@@ -1596,7 +1596,7 @@ def _synthesize_capcut_tts_sync(text: str, voice: str = "") -> Optional[bytes]:
                 break
             if st == "failed":
                 raise RuntimeError(f"CapCut TTS task failed: {qt}")
-            time.sleep(0.35)
+            time.sleep(1.2)
         if not audio_url:
             raise TimeoutError("CapCut TTS timed out")
         r = httpx.get(audio_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
