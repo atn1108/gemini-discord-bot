@@ -1409,7 +1409,7 @@ class RelayHub:
                     if not fut.done():
                         fut.set_result({"ok": False, "error": "relay disconnected"})
                     self._jobs.pop(jid, None)
-                logger.info("Chrome relay disconnected")
+                logger.info(f"Chrome relay disconnected (code={ws.close_code}, err={ws.exception()})")
         return ws
 
     async def generate_image(self, prompt: str, aspect_ratio: str = "", timeout: float = 120) -> tuple[Optional[bytes], str, str]:
@@ -1523,7 +1523,12 @@ async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "")
                 return f"Generated and sent image via Pollinations fallback to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
 
         if not url:
-            detail = f"relay: {relay_err}" if relay_err else (poly_err or "no image returned")
+            if relay_err:
+                detail = f"relay: {relay_err}"
+            elif not relay_hub.is_connected:
+                detail = poly_err or "Chrome relay offline & no image returned"
+            else:
+                detail = poly_err or "no image returned"
             return f"ERROR: image generator unavailable ({detail})"
         if IMAGE_DEFAULT_ONLY:
             return (f"IMAGE_FETCH_BLOCKED: Default Gemini Web generated the image at {url} "
@@ -2277,13 +2282,9 @@ async def on_message(message):
                     f"({len(pending[message.channel.id])} buffered): {content[:60]!r}")
         return
 
-    # Forced image generation — "bé yêu vẽ ảnh ...", "bé yêu tạo ảnh ...", "/draw"
-    img_prompt = image_query(content)
-    if img_prompt and (mentioned or any(kw in content.lower() for kw in KEYWORDS)):
-        logger.info(f"forced image from {message.author.display_name}: {img_prompt!r}")
-        async with message.channel.typing():
-            await deliver_image(message.channel, message.reply, img_prompt)
-        return
+    # Natural-language image requests go through run_tool_loop -> generate_image
+    # so the model applies SYSTEM_PROMPT + conversation context (e.g. "bản thân bé").
+    # Use /draw for raw prompt bypass without LLM rewriting.
 
     # Remember / forget — gated on the trigger so a random "quên ... " in chat
     # never deletes stored facts.

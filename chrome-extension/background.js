@@ -429,9 +429,13 @@ function scheduleReconnect() {
   if (reconnectTimer) return;
   const delay = reconnectDelayMs;
   reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30000);
+  try {
+    chrome.alarms.create("relay-reconnect", { when: Date.now() + delay });
+  } catch {}
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    connectRelay();
+    chrome.alarms.create("relay-keepalive", { periodInMinutes: 0.5 });
+connectRelay();
   }, delay);
 }
 
@@ -575,18 +579,21 @@ async function _connectRelayImpl(force = false) {
 
 chrome.runtime.onInstalled.addListener(() => {
   ensureNetRules().catch(() => {});
-  chrome.alarms.create("relay-keepalive", { periodInMinutes: 1 });
-  connectRelay();
+  chrome.alarms.create("relay-keepalive", { periodInMinutes: 0.5 });
+  chrome.alarms.create("relay-keepalive", { periodInMinutes: 0.5 });
+connectRelay();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   ensureNetRules().catch(() => {});
-  chrome.alarms.create("relay-keepalive", { periodInMinutes: 1 });
-  connectRelay();
+  chrome.alarms.create("relay-keepalive", { periodInMinutes: 0.5 });
+  chrome.alarms.create("relay-keepalive", { periodInMinutes: 0.5 });
+connectRelay();
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "relay-keepalive") connectRelay();
+  if (alarm.name === "relay-keepalive" || alarm.name === "relay-reconnect") chrome.alarms.create("relay-keepalive", { periodInMinutes: 0.5 });
+connectRelay();
 });
 
 chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
@@ -614,4 +621,5 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
   }
 });
 
+chrome.alarms.create("relay-keepalive", { periodInMinutes: 0.5 });
 connectRelay();
