@@ -9,14 +9,17 @@ import re
 import asyncio
 import datetime
 import base64
+import hmac
 import html
 import ipaddress
 import socket
 import urllib.parse
+import uuid
 import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
 from typing import List, Dict, Optional, Any
 import time
+from aiohttp import web
 
 try:  # optional dependency-free enough module that lives next to this file
     from gemini_wm import remove_watermark as _gemini_wm_remove
@@ -66,6 +69,9 @@ IMAGE_DEFAULT_ONLY = os.getenv("IMAGE_DEFAULT_ONLY", "false").strip().lower() in
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image").strip()
 GEMINI_COOKIES = os.getenv("GEMINI_COOKIES", "")
+RELAY_SECRET = os.getenv("RELAY_SECRET", "").strip()
+RELAY_PORT = int(os.getenv("PORT", os.getenv("RELAY_PORT", "8080")))
+RELAY_ENABLED = os.getenv("RELAY_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 # Strip the visible Gemini "sparkle" watermark from generated images before they
 # are uploaded to Discord (server-side alpha unblend, no browser needed).
 REMOVE_GEMINI_WATERMARK = os.getenv("REMOVE_GEMINI_WATERMARK", "1").strip().lower() not in (
@@ -1329,10 +1335,125 @@ async def _generate_via_pollinations(client: httpx.AsyncClient, prompt: str,
     return None, last_err
 
 
+class RelayHub:
+    """WebSocket bridge between Railway bot and user's Chrome extension relay."""
+
+    def __init__(self) -> None:
+        self._ws: Optional[web.WebSocketResponse] = None
+        self._jobs: Dict[str, asyncio.Future] = {}
+        self._meta: Dict[str, Any] = {}
+
+    @property
+    def is_connected(self) -> bool:
+        return self._ws is not None and not self._ws.closed
+
+    @staticmethod
+    def _authorized(request: web.Request) -> bool:
+        if not RELAY_SECRET:
+            return False
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:].strip() if auth.startswith("Bearer ") else request.query.get("token", "").strip()
+        return bool(token) and hmac.compare_digest(token, RELAY_SECRET)
+
+    async def handle_health(self, request: web.Request) -> web.Response:
+        return web.json_response({
+            "ok": True,
+            "relay_connected": self.is_connected,
+            "relay_configured": bool(RELAY_SECRET),
+            "extension": self._meta,
+        })
+
+    async def handle_ws(self, request: web.Request) -> web.StreamResponse:
+        if not self._authorized(request):
+            return web.Response(status=401 if RELAY_SECRET else 503, text="unauthorized")
+        ws = web.WebSocketResponse(max_msg_size=25 * 1024 * 1024, heartbeat=25.0)
+        await ws.prepare(request)
+        prev = self._ws
+        self._ws = ws
+        if prev is not None and prev is not ws and not prev.closed:
+            await prev.close(code=1000, message=b"replaced")
+        logger.info("Chrome relay connected")
+        try:
+            async for msg in ws:
+                if msg.type != web.WSMsgType.TEXT:
+                    continue
+                try:
+                    data = json.loads(msg.data)
+                except Exception:
+                    continue
+                mtype = data.get("type")
+                if mtype == "ping":
+                    await ws.send_json({"type": "pong", "ts": data.get("ts")})
+                elif mtype == "hello":
+                    self._meta = {
+                        "version": str(data.get("version") or ""),
+                        "temp_chat": bool(data.get("temp_chat", True)),
+                    }
+                elif mtype == "image_result":
+                    fut = self._jobs.pop(str(data.get("id") or ""), None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(data)
+        finally:
+            if self._ws is ws:
+                self._ws = None
+                for jid, fut in list(self._jobs.items()):
+                    if not fut.done():
+                        fut.set_result({"ok": False, "error": "relay disconnected"})
+                    self._jobs.pop(jid, None)
+                logger.info("Chrome relay disconnected")
+        return ws
+
+    async def generate_image(self, prompt: str, aspect_ratio: str = "", timeout: float = 120) -> tuple[Optional[bytes], str, str]:
+        if not self.is_connected or self._ws is None:
+            return None, "", "relay offline"
+        job_id = uuid.uuid4().hex
+        fut = asyncio.get_running_loop().create_future()
+        self._jobs[job_id] = fut
+        try:
+            await self._ws.send_json({
+                "type": "generate_image",
+                "id": job_id,
+                "prompt": prompt,
+                "aspect_ratio": aspect_ratio,
+            })
+            res = await asyncio.wait_for(fut, timeout=timeout)
+        except Exception as e:
+            self._jobs.pop(job_id, None)
+            return None, "", str(e)
+        if not res.get("ok"):
+            return None, "", str(res.get("error") or "relay failed")
+        b64 = res.get("b64") or ""
+        if not b64:
+            return None, "", "relay returned empty image"
+        try:
+            raw = base64.b64decode(b64)
+        except Exception as e:
+            return None, "", f"invalid base64: {e}"
+        mime = str(res.get("mime") or "image/png").lower()
+        ext = ".jpg" if ("jpeg" in mime or "jpg" in mime) else (".webp" if "webp" in mime else ".png")
+        return raw, ext, ""
+
+
+relay_hub = RelayHub()
+
+
 async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "") -> str:
     prompt = (prompt or "").strip()
     if not prompt:
         return "ERROR: empty image prompt"
+
+    full_prompt = f"{prompt} (aspect ratio {aspect_ratio.strip()})" if aspect_ratio.strip() else prompt
+
+    # 0. Chrome extension relay running on user's PC (same IP + full cookie jar).
+    if relay_hub.is_connected:
+        relay_raw, relay_ext, relay_err = await relay_hub.generate_image(
+            full_prompt, aspect_ratio, timeout=IMAGE_GEN_TIMEOUT
+        )
+        if relay_raw:
+            relay_raw = _strip_gemini_watermark(relay_raw)
+            await channel.send(file=discord.File(io.BytesIO(relay_raw), filename=f"image{relay_ext}"))
+            return f"Generated and sent image via Chrome relay to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
+        logger.warning(f"Chrome relay image failed: {relay_err}")
 
     # 1. Official Gemini API (skipped when IMAGE_DEFAULT_ONLY forces gemini-web-to-api).
     if not IMAGE_DEFAULT_ONLY:
@@ -1343,7 +1464,6 @@ async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "")
             await channel.send(file=discord.File(io.BytesIO(raw), filename=f"image{ext}"))
             return f"Generated and sent image via Gemini API to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
 
-    full_prompt = f"{prompt} (aspect ratio {aspect_ratio.strip()})" if aspect_ratio.strip() else prompt
     async with httpx.AsyncClient(timeout=IMAGE_GEN_TIMEOUT) as client:
         # 2. Default generator: gemini-web-to-api b64_json.
         try:
@@ -2349,6 +2469,29 @@ async def skill_remove_cmd(ctx, name: str):
 async def on_connect():
     await init_db()
 
+async def _start_relay_server() -> Optional[web.AppRunner]:
+    if not RELAY_ENABLED:
+        return None
+    app = web.Application()
+    app.router.add_get("/health", relay_hub.handle_health)
+    app.router.add_get("/ws/relay", relay_hub.handle_ws)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", RELAY_PORT)
+    await site.start()
+    logger.info(f"Relay HTTP/WS server listening on 0.0.0.0:{RELAY_PORT}")
+    return runner
+
+
+async def _main():
+    runner = await _start_relay_server()
+    try:
+        await bot.start(DISCORD_TOKEN)
+    finally:
+        if runner is not None:
+            await runner.cleanup()
+
+
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         logger.error("DISCORD_TOKEN not set")
@@ -2356,4 +2499,4 @@ if __name__ == "__main__":
     if not DATABASE_URL:
         logger.error("DATABASE_URL not set")
         exit(1)
-    bot.run(DISCORD_TOKEN)
+    asyncio.run(_main())

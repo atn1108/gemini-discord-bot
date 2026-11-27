@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <title>Gemini Image Relay</title>
+  <style>
+    body { font-family: system-ui, sans-serif; width: 320px; margin: 12px; color: #111; }
+    h3 { margin: 0 0 8px; font-size: 15px; }
+    label { display: block; font-size: 12px; font-weight: 600; margin-top: 8px; }
+    input[type="text"], input[type="password"] {
+      width: 100%; box-sizing: border-box; padding: 6px 8px; margin-top: 4px;
+      border: 1px solid #ccc; border-radius: 6px; font-size: 12px;
+    }
+    .row { display: flex; align-items: center; gap: 6px; margin-top: 10px; font-size: 12px; }
+    .btns { display: flex; gap: 8px; margin-top: 12px; }
+    button {
+      flex: 1; padding: 7px 10px; border: 0; border-radius: 6px; cursor: pointer;
+      font-weight: 600; font-size: 12px;
+    }
+    #saveBtn { background: #1a73e8; color: #fff; }
+    #testBtn { background: #eee; color: #111; }
+    #status {
+      margin-top: 10px; padding: 8px; border-radius: 6px; font-size: 12px;
+      background: #f5f5f5; word-break: break-word;
+    }
+    .ok { color: #137333; font-weight: 600; }
+    .err { color: #c5221f; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h3>Gemini Discord Image Relay</h3>
+  <label>Relay WebSocket URL
+    <input id="wsUrl" type="text" placeholder="wss://.../ws/relay" />
+  </label>
+  <label>Relay Token
+    <input id="token" type="password" placeholder="RELAY_SECRET" />
+  </label>
+  <label class="row">
+    <input id="tempChat" type="checkbox" checked />
+    <span>Temporary chat (không lưu lịch sử Gemini)</span>
+  </label>
+  <div class="btns">
+    <button id="saveBtn">Lưu &amp; Kết nối</button>
+    <button id="testBtn">Test Gen Ảnh</button>
+  </div>
+  <div id="status">Đang tải...</div>
+  <script src="popup.js"></script>
+</body>
+</html>

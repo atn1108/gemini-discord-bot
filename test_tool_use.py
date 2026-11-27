@@ -940,6 +940,50 @@ async def image_gen_checks():
         bot_mod._download_image_bytes = real_dl
         bot_mod._generate_via_pollinations = real_poly
 
+    # Chrome extension WebSocket relay server & priority check
+    import aiohttp
+    from aiohttp import web
+    real_secret = bot_mod.RELAY_SECRET
+    bot_mod.RELAY_SECRET = "test-relay-secret"
+    app = web.Application()
+    app.router.add_get("/health", bot_mod.relay_hub.handle_health)
+    app.router.add_get("/ws/relay", bot_mod.relay_hub.handle_ws)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(f"http://127.0.0.1:{port}/ws/relay?token=wrong") as bad_r:
+                check("relay: rejects wrong token with 401", bad_r.status == 401, bad_r.status)
+
+            async with sess.ws_connect(f"ws://127.0.0.1:{port}/ws/relay?token=test-relay-secret") as ws:
+                await ws.send_json({"type": "hello", "version": "1.0.0", "temp_chat": True})
+                await ws.send_json({"type": "ping", "ts": 123})
+                pong = await ws.receive_json()
+                check("relay: ping/pong keeps WS alive", pong.get("type") == "pong" and pong.get("ts") == 123, pong)
+
+                async def _serve_job():
+                    req = await ws.receive_json()
+                    await ws.send_json({
+                        "type": "image_result",
+                        "id": req["id"],
+                        "ok": True,
+                        "b64": base64.b64encode(png_bytes).decode(),
+                        "mime": "image/png",
+                    })
+
+                sent_imgs.clear()
+                worker = asyncio.create_task(_serve_job())
+                out_relay = await bot_mod._generate_and_send_image(ImgChan(), "relay cat", "1:1")
+                await worker
+                check("relay: _generate_and_send_image prefers connected Chrome relay",
+                      "Chrome relay" in out_relay and sent_imgs and sent_imgs[0][1] == png_bytes, out_relay)
+    finally:
+        await runner.cleanup()
+        bot_mod.RELAY_SECRET = real_secret
+
 
 run_now(image_gen_checks())
 check("img query: extracts prompt after prefix", bot_mod.image_query("vẽ ảnh con mèo") == "con mèo")
