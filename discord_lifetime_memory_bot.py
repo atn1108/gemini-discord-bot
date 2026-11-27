@@ -1093,7 +1093,7 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
         targets = [f"ytsearch1:{q}", f"scsearch1:{q}"]
 
     base_opts: Dict[str, Any] = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[acodec=flac]/bestaudio[acodec=opus]/bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -1151,9 +1151,31 @@ def _create_audio_source(stream_url: str, volume: float = 1.0):
     raw = discord.FFmpegPCMAudio(
         stream_url,
         before_options=before,
-        options="-vn",
+        options="-vn -ar 48000 -ac 2",
     )
     return discord.PCMVolumeTransformer(raw, volume=max(0.0, min(float(volume), 2.0)))
+
+
+def _tune_voice_encoder(vc) -> None:
+    """Tune Opus encoder to maximum Discord fidelity (fullband, music signal, channel-max bitrate)."""
+    enc = getattr(vc, "encoder", None)
+    if enc is None:
+        return
+    try:
+        ch_bps = getattr(getattr(vc, "channel", None), "bitrate", 96000) or 96000
+        kbps = max(128, min(int(ch_bps) // 1000, 384))
+        if hasattr(enc, "set_bitrate"):
+            enc.set_bitrate(kbps)
+        if hasattr(enc, "set_signal_type"):
+            enc.set_signal_type("music")
+        if hasattr(enc, "set_bandwidth"):
+            enc.set_bandwidth("full")
+        if hasattr(enc, "set_fec"):
+            enc.set_fec(True)
+        if hasattr(enc, "set_expected_packet_loss_percent"):
+            enc.set_expected_packet_loss_percent(0.05)
+    except Exception as e:
+        logger.debug(f"Opus encoder tune skipped: {e}")
 
 
 async def _play_next_track(guild: discord.Guild) -> None:
@@ -1190,6 +1212,7 @@ async def _play_next_track(guild: discord.Guild) -> None:
                 )
 
             vc.play(source, after=_after)
+            _tune_voice_encoder(vc)
         except Exception as e:
             logger.warning(f"vc.play failed in {guild.id}: {e}")
             state.current = None
