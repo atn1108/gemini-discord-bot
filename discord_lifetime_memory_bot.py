@@ -62,6 +62,7 @@ IMAGE_GEN_URL = os.getenv(
     "https://gemini-web-to-api-production.up.railway.app/openai/v1/images/generations",
 )
 IMAGE_GEN_TIMEOUT = int(os.getenv("IMAGE_GEN_TIMEOUT", "120"))
+IMAGE_DEFAULT_ONLY = os.getenv("IMAGE_DEFAULT_ONLY", "false").strip().lower() in ("1", "true", "yes", "on")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image").strip()
 GEMINI_COOKIES = os.getenv("GEMINI_COOKIES", "")
@@ -1333,17 +1334,18 @@ async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "")
     if not prompt:
         return "ERROR: empty image prompt"
 
-    # 1. Official Gemini API (returns direct inline image bytes, immune to CDN 403).
-    api_img = await _generate_via_gemini_api(prompt, aspect_ratio)
-    if api_img is not None:
-        raw, ext = api_img
-        raw = _strip_gemini_watermark(raw)
-        await channel.send(file=discord.File(io.BytesIO(raw), filename=f"image{ext}"))
-        return f"Generated and sent image via Gemini API to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
+    # 1. Official Gemini API (skipped when IMAGE_DEFAULT_ONLY forces gemini-web-to-api).
+    if not IMAGE_DEFAULT_ONLY:
+        api_img = await _generate_via_gemini_api(prompt, aspect_ratio)
+        if api_img is not None:
+            raw, ext = api_img
+            raw = _strip_gemini_watermark(raw)
+            await channel.send(file=discord.File(io.BytesIO(raw), filename=f"image{ext}"))
+            return f"Generated and sent image via Gemini API to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
 
     full_prompt = f"{prompt} (aspect ratio {aspect_ratio.strip()})" if aspect_ratio.strip() else prompt
     async with httpx.AsyncClient(timeout=IMAGE_GEN_TIMEOUT) as client:
-        # 2. Fallback: gemini-web-to-api b64_json.
+        # 2. Default generator: gemini-web-to-api b64_json.
         try:
             r = await client.post(IMAGE_GEN_URL, json={
                 "prompt": full_prompt,
@@ -1361,7 +1363,7 @@ async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "")
         except Exception as e:
             logger.warning(f"image b64_json failed: {e}")
 
-        # 3. Fallback: request URL from gemini-web-to-api and attempt direct fetch.
+        # 3. Default generator URL mode + direct fetch attempt.
         url = ""
         try:
             r2 = await client.post(IMAGE_GEN_URL, json={
@@ -1381,15 +1383,20 @@ async def _generate_and_send_image(channel, prompt: str, aspect_ratio: str = "")
         except Exception as e:
             logger.warning(f"image url fallback failed: {e}")
 
-        # 4. Final fallback: Pollinations (keyless direct JPEG, works when Gemini 429/CDN 403).
-        poly, poly_err = await _generate_via_pollinations(client, prompt, aspect_ratio)
-        if poly:
-            poly = _strip_gemini_watermark(poly)
-            await channel.send(file=discord.File(io.BytesIO(poly), filename="image.jpg"))
-            return f"Generated and sent image via Pollinations fallback to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
+        # 4. Final fallback: Pollinations (disabled when IMAGE_DEFAULT_ONLY is on).
+        poly_err = ""
+        if not IMAGE_DEFAULT_ONLY:
+            poly, poly_err = await _generate_via_pollinations(client, prompt, aspect_ratio)
+            if poly:
+                poly = _strip_gemini_watermark(poly)
+                await channel.send(file=discord.File(io.BytesIO(poly), filename="image.jpg"))
+                return f"Generated and sent image via Pollinations fallback to #{getattr(channel, 'name', getattr(channel, 'id', 'channel'))}."
 
         if not url:
             return f"ERROR: image generator unavailable ({poly_err or 'no image returned'})"
+        if IMAGE_DEFAULT_ONLY:
+            return (f"IMAGE_FETCH_BLOCKED: Default Gemini Web generated the image at {url} "
+                    f"but Google CDN returned HTTP 403 when fetching bytes (fallback is currently disabled via IMAGE_DEFAULT_ONLY).")
         hint = (
             " Set GEMINI_API_KEY in Railway to bypass the Google CDN 403."
             if not GEMINI_API_KEY else ""
@@ -1776,6 +1783,25 @@ def _match_prefix(text: str, prefixes: tuple) -> Optional[str]:
     )
     return text[m.end():].strip() if m else None
 
+IMAGE_PREFIXES = ("vẽ ảnh ", "ve anh ", "tạo ảnh ", "tao anh ", "draw ", "gen ảnh ", "gen anh ")
+
+
+def image_query(content: str) -> Optional[str]:
+    """Return the image prompt if the triggered message starts with a draw prefix."""
+    return _match_prefix(strip_keywords(content), IMAGE_PREFIXES) or None
+
+
+async def deliver_image(channel, send, prompt: str, aspect_ratio: str = "") -> None:
+    """Force-run image generation and post either the image attachment or exact status/link."""
+    out = await _generate_and_send_image(channel, prompt, aspect_ratio)
+    if out.startswith("Generated and sent"):
+        await send(f"🎨 {out}")
+    elif out.startswith("IMAGE_FETCH_BLOCKED:"):
+        await send(f"⚠️ {out.replace('IMAGE_FETCH_BLOCKED: ', '', 1)}")
+    else:
+        await send(f"❌ {out}")
+
+
 def research_query(content: str) -> Optional[str]:
     """Return the research topic if this message is a research request, else None.
 
@@ -2120,6 +2146,14 @@ async def on_message(message):
                     f"({len(pending[message.channel.id])} buffered): {content[:60]!r}")
         return
 
+    # Forced image generation — "bé yêu vẽ ảnh ...", "bé yêu tạo ảnh ...", "/draw"
+    img_prompt = image_query(content)
+    if img_prompt and (mentioned or any(kw in content.lower() for kw in KEYWORDS)):
+        logger.info(f"forced image from {message.author.display_name}: {img_prompt!r}")
+        async with message.channel.typing():
+            await deliver_image(message.channel, message.reply, img_prompt)
+        return
+
     # Remember / forget — gated on the trigger so a random "quên ... " in chat
     # never deletes stored facts.
     fact = remember_query(content)
@@ -2248,6 +2282,15 @@ async def research(
         return await ctx.followup.send(text, wait=True)
 
     await deliver_research(_send, query, max_sources)
+
+@bot.slash_command(name="draw", description="Ép bot chạy tạo ảnh trực tiếp (bỏ qua chat)")
+async def draw_cmd(ctx, prompt: str, aspect_ratio: str = ""):
+    await ctx.defer()
+
+    async def _send(text: str):
+        return await ctx.followup.send(text)
+
+    await deliver_image(ctx.channel, _send, prompt, aspect_ratio)
 
 @bot.slash_command(name="skills", description="Danh sách các skill đã cài cho Bé Yêu")
 async def skills_cmd(ctx):

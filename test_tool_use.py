@@ -921,18 +921,29 @@ async def image_gen_checks():
         check("img: Pollinations fallback sends image on CDN 403",
               "Pollinations" in out_poly and sent_imgs and sent_imgs[0][0] == "image.jpg", out_poly)
 
+        # If IMAGE_DEFAULT_ONLY is on, skip Gemini API and Pollinations completely.
+        bot_mod.IMAGE_DEFAULT_ONLY = True
+        sent_imgs.clear()
+        out_def = await bot_mod._generate_and_send_image(ImgChan(), "cute cat")
+        check("img: IMAGE_DEFAULT_ONLY skips Pollinations fallback",
+              "IMAGE_FETCH_BLOCKED" in out_def and "IMAGE_DEFAULT_ONLY" in out_def and not sent_imgs, out_def)
+        bot_mod.IMAGE_DEFAULT_ONLY = False
+
         # If Pollinations also fails, report the 403 URL honestly.
         bot_mod._generate_via_pollinations = no_poly
         out2 = await bot_mod._generate_and_send_image(ImgChan(), "cute cat")
         check("img: 403 CDN fallback reports URL honestly",
               "IMAGE_FETCH_BLOCKED" in out2 and "lh3.googleusercontent.com" in out2, out2)
     finally:
+        bot_mod.IMAGE_DEFAULT_ONLY = False
         bot_mod.httpx.AsyncClient = real_client
         bot_mod._download_image_bytes = real_dl
         bot_mod._generate_via_pollinations = real_poly
 
 
 run_now(image_gen_checks())
+check("img query: extracts prompt after prefix", bot_mod.image_query("vẽ ảnh con mèo") == "con mèo")
+check("img query: ignores plain text", bot_mod.image_query("hôm nay trời đẹp") is None)
 
 # 7e. attachment reading (text, PDF, image -> multimodal live payload, plain text in DB)
 async def attachment_checks():
