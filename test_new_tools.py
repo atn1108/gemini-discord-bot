@@ -185,6 +185,22 @@ async def main():
         tr = b._extract_track_info("https://youtu.be/kvsDx1AEjJE")
         check("yt bot-check fallback to scsearch", tr["title"] == "One More Lawn", tr)
 
+    # 11. Clean track query + best match + queue clear/remove
+    check("clean query", b._clean_track_query("SON TUNG M-TP | SUPERCAR | OFFICIAL TEASER") == "SON TUNG M-TP SUPERCAR")
+    best = b._pick_best_entry([
+        {"title": "MAKING MY WAY", "url": "https://a"},
+        {"title": "SON TUNG M-TP - SUPERCAR", "url": "https://b"},
+    ], "SON TUNG M-TP SUPERCAR")
+    check("pick best entry", best and best["url"] == "https://b", best)
+
+    st = b.music_states[guild.id]
+    st.queue.clear()
+    st.queue.extend([{"title": "A"}, {"title": "B"}, {"title": "C"}])
+    res = await b.execute_tool("music_control", {"action": "remove", "indices": [1, 3]}, guild, channel, caller, admin=False)
+    check("queue remove", "Removed 2" in res and [t["title"] for t in st.queue] == ["B"], res)
+    res = await b.execute_tool("music_control", {"action": "clear"}, guild, channel, caller, admin=False)
+    check("queue clear", "Cleared 1" in res and len(st.queue) == 0, res)
+
     print("\nALL NEW TOOLS PASSED")
 
 

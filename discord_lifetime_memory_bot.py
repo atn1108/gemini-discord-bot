@@ -808,11 +808,14 @@ TOOLS: List[Dict] = [
             "required": ["query"]}}},
     {"type": "function", "function": {
         "name": "music_control",
-        "description": "Control music playback or view the queue in this server.",
+        "description": "Control music playback or manage the queue in this server.",
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string",
-                       "enum": ["skip", "pause", "resume", "stop", "queue"],
-                       "description": "Playback action to perform"}},
+                       "enum": ["skip", "pause", "resume", "stop", "queue", "clear", "remove"],
+                       "description": "Playback or queue action ('clear' empties queue without leaving voice; 'remove' removes queued track numbers)"},
+            "index": {"type": "integer", "description": "1-based queue position to remove when action='remove'"},
+            "indices": {"type": "array", "items": {"type": "integer"},
+                        "description": "List of 1-based queue positions to remove when action='remove'"}},
             "required": ["action"]}}},
     # Web search & page reader (safe for everyone).
     {"type": "function", "function": {
@@ -1069,12 +1072,32 @@ def _format_duration(seconds) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+def _clean_track_query(title: str) -> str:
+    s = re.sub(r"\[[^\]]*\]|\([^)]*(?:official|mv|video|audio|lyrics|visualizer|teaser|hd|4k)[^)]*\)", " ", title, flags=re.I)
+    s = re.sub(r"\b(?:official\s+(?:music\s+)?(?:video|mv|audio|visualizer|teaser|lyric\s+video)|lyrics?|hd|4k)\b", " ", s, flags=re.I)
+    s = s.replace("|", " ")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _pick_best_entry(entries: List[Dict[str, Any]], expected_title: str = "") -> Optional[Dict[str, Any]]:
+    valid = [e for e in entries if e and e.get("url")]
+    if not valid:
+        return None
+    if not expected_title or len(valid) == 1:
+        return valid[0]
+    words = [w for w in re.findall(r"[a-z0-9\u00c0-\u024f\u1e00-\u1eff]+", expected_title.lower()) if len(w) >= 3]
+    if not words:
+        return valid[0]
+    best = max(valid, key=lambda e: sum(1 for w in words if w in (e.get("title") or "").lower()))
+    return best
+
+
 def _extract_track_info(query: str) -> Dict[str, Any]:
     """Blocking yt-dlp extraction (run via asyncio.to_thread).
 
     Supports YouTube (with optional YTDLP_COOKIES / YTDLP_PO_TOKEN),
     SoundCloud URLs or `scsearch:` queries, and Spotify URLs (resolved via oEmbed).
-    Falls back to SoundCloud search if YouTube search fails (e.g. bot check).
+    Falls back to SoundCloud search if YouTube fails (e.g. bot check / 403).
     """
     import yt_dlp
 
@@ -1090,7 +1113,7 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
     if is_url or has_prefix:
         targets = [q]
     else:
-        targets = [f"ytsearch1:{q}", f"scsearch1:{q}"]
+        targets = [f"ytsearch1:{q}", f"scsearch3:{q}"]
 
     base_opts: Dict[str, Any] = {
         "format": "bestaudio[acodec=flac]/bestaudio[acodec=opus]/bestaudio/best",
@@ -1103,13 +1126,18 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
     cookiefile = _get_ytdlp_cookiefile()
     if cookiefile:
         base_opts["cookiefile"] = cookiefile
-    yt_args: Dict[str, Any] = {"player_client": ["tv", "android_vr", "web"]}
+    yt_args: Dict[str, Any] = {}
+    if not cookiefile:
+        # tv / android_vr don't use cookies; only use them when cookiefile isn't set.
+        yt_args["player_client"] = ["tv", "android_vr", "web"]
     if YTDLP_PO_TOKEN:
         yt_args["po_token"] = [f"web+{YTDLP_PO_TOKEN}"]
-    base_opts["extractor_args"] = {"youtube": yt_args}
+    if yt_args:
+        base_opts["extractor_args"] = {"youtube": yt_args}
 
     last_err: Optional[Exception] = None
     info = None
+    expected_title = "" if is_url else q
     idx = 0
     while idx < len(targets):
         target = targets[idx]
@@ -1119,8 +1147,7 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
                 info = ydl.extract_info(target, download=False)
             if info:
                 if "entries" in info:
-                    entries = [e for e in (info.get("entries") or []) if e]
-                    info = entries[0] if entries else None
+                    info = _pick_best_entry(info.get("entries") or [], expected_title)
                 if info and info.get("url"):
                     # Verify googlevideo stream URL is actually readable with its headers
                     # (Railway datacenter IPs often get 403 on ANDROID_VR / WEB without PO token).
@@ -1133,16 +1160,16 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
                     break
         except Exception as e:
             last_err = e
-            yt_title = None
-            if info and isinstance(info, dict):
-                yt_title = info.get("title")
+            yt_title = info.get("title") if isinstance(info, dict) else None
             info = None
             # If a direct YouTube URL hits bot-check or 403 on datacenter IP, resolve its title
             # via YouTube oEmbed and fall back to SoundCloud search automatically.
             if is_yt_url and target == q:
                 yt_title = yt_title or _oembed_title("https://www.youtube.com/oembed", q)
                 if yt_title:
-                    targets.append(f"scsearch1:{yt_title}")
+                    clean_title = _clean_track_query(yt_title) or yt_title
+                    expected_title = clean_title
+                    targets.append(f"scsearch3:{clean_title}")
 
     if not info or not info.get("url"):
         raise ValueError(str(last_err) if last_err else "No playable audio stream URL returned")
@@ -1303,7 +1330,8 @@ async def _handle_play_music(guild: discord.Guild, caller: Optional[discord.Memb
             f"({_format_duration(track['duration'])}){mute_note}")
 
 
-async def _handle_music_control(guild: discord.Guild, action: str) -> str:
+async def _handle_music_control(guild: discord.Guild, action: str,
+                                index: Any = None, indices: Any = None) -> str:
     action = (action or "").strip().lower()
     state = music_states[guild.id]
     vc = getattr(guild, "voice_client", None)
@@ -1317,6 +1345,34 @@ async def _handle_music_control(guild: discord.Guild, action: str) -> str:
         for idx, t in enumerate(list(state.queue)[:10], 1):
             lines.append(f"{idx}. {t['title']} ({_format_duration(t.get('duration'))})")
         return "\n".join(lines) if lines else "Queue is empty."
+
+    if action == "clear":
+        n = len(state.queue)
+        state.queue.clear()
+        return f"Cleared {n} queued track(s) (kept current playback and stayed in voice)."
+
+    if action == "remove":
+        raw_idxs: List[int] = []
+        if isinstance(indices, list):
+            for x in indices:
+                try:
+                    raw_idxs.append(int(x))
+                except Exception:
+                    pass
+        if index is not None:
+            try:
+                raw_idxs.append(int(index))
+            except Exception:
+                pass
+        q_list = list(state.queue)
+        removed = []
+        for pos in sorted(set(raw_idxs), reverse=True):
+            if 1 <= pos <= len(q_list):
+                removed.append(q_list.pop(pos - 1)["title"])
+        state.queue = deque(q_list, maxlen=MUSIC_QUEUE_MAX)
+        if not removed:
+            return "ERROR: invalid queue index or queue is empty."
+        return f"Removed {len(removed)} track(s) from queue: {', '.join(reversed(removed))}"
 
     if vc is None:
         return "ERROR: Bot is not currently in a voice channel."
@@ -2700,7 +2756,10 @@ async def execute_tool(name: str, args: Dict, guild: discord.Guild,
             return await _handle_play_music(guild, caller, args.get("query") or "")
 
         if name == "music_control":
-            return await _handle_music_control(guild, args.get("action") or "")
+            return await _handle_music_control(
+                guild, args.get("action") or "",
+                index=args.get("index"), indices=args.get("indices"),
+            )
 
         if name == "web_search":
             return await _web_search(args.get("query") or "", args.get("max_results") or 5)
