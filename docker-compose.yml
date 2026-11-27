@@ -1,0 +1,81 @@
+# docker-compose.yml — chạy toàn bộ stack trên VPS / GCP e2-micro / máy cá nhân
+# Lệnh: docker compose up -d
+#
+# Service được gộp:
+#   - gemini-discord-bot  : bot chính (đã tích hợp relay + forwarder)
+#   - gemini-web-to-api   : Gemini Web proxy (chat + image + deep research)
+#
+# Cần tạo file .env trước khi chạy (xem .env.example)
+
+version: "3.9"
+
+services:
+  # ── 1. Gemini Web-to-API proxy ───────────────────────────────────────────
+  gemini-web-to-api:
+    image: ghcr.io/your-org/gemini-web-to-api:latest   # thay bằng image của mày
+    build:
+      context: ../gemini-web-to-api                     # hoặc dùng image có sẵn
+    restart: unless-stopped
+    environment:
+      - GEMINI_COOKIES=${GEMINI_COOKIES}
+      - PORT=3000
+      - APP_ENV=production
+      - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED:-true}
+      - RATE_LIMIT_MAX_REQUESTS=${RATE_LIMIT_MAX_REQUESTS:-20}
+      - RATE_LIMIT_WINDOW_MS=${RATE_LIMIT_WINDOW_MS:-60000}
+    ports:
+      - "3000:3000"       # expose ra ngoài nếu cần debug; bỏ dòng này khi prod
+    networks:
+      - bot-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── 2. Discord bot (đã tích hợp relay + forwarder) ───────────────────────
+  gemini-discord-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      gemini-web-to-api:
+        condition: service_healthy
+    environment:
+      # Discord
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - BOT_USERNAME=${BOT_USERNAME:-Bé Yêu}
+      - BOT_AVATAR=${BOT_AVATAR:-}
+      # Database — dùng Neon (thay DATABASE_URL bằng connection string của Neon)
+      - DATABASE_URL=${DATABASE_URL}
+      # Gemini
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_IMAGE_MODEL=${GEMINI_IMAGE_MODEL:-gemini-2.5-flash-image}
+      - GEMINI_COOKIES=${GEMINI_COOKIES:-}
+      # Trỏ thẳng vào gemini-web-to-api (nội bộ docker network, không qua internet)
+      - GEMINI_CHAT_URL=http://gemini-web-to-api:3000/openai/v1/chat/completions
+      - DEEP_RESEARCH_URL=http://gemini-web-to-api:3000/gemini/v1beta/deepresearch
+      - IMAGE_GEN_URL=http://gemini-web-to-api:3000/openai/v1/images/generations
+      # Bỏ WEBHOOK_URL → gọi thẳng, không qua forwarder
+      - WEBHOOK_URL=
+      # Relay (Chrome extension kết nối vào đây)
+      - RELAY_ENABLED=${RELAY_ENABLED:-true}
+      - RELAY_SECRET=${RELAY_SECRET}
+      - PORT=8080
+      # Bot settings
+      - ADMIN_IDS=${ADMIN_IDS:-}
+      - ENABLE_TOOLS=${ENABLE_TOOLS:-true}
+      - MAX_HISTORY=${MAX_HISTORY:-50}
+      - REMOVE_GEMINI_WATERMARK=${REMOVE_GEMINI_WATERMARK:-1}
+      - TRIGGER_KEYWORDS=${TRIGGER_KEYWORDS:-gemini,ai,ask,hey bot}
+    ports:
+      - "8080:8080"       # Chrome relay WebSocket
+    networks:
+      - bot-net
+    volumes:
+      - ./skills:/app/skills:ro    # skill files mount read-only
+
+networks:
+  bot-net:
+    driver: bridge

@@ -30,7 +30,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ===== CONFIG (Railway Variables) =====
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://gemini-discord-forwarder-production.up.railway.app/webhook/gemini-to-discord")
+# GEMINI_CHAT_URL: gọi thẳng gemini-web-to-api, bỏ qua forwarder trung gian.
+# Đặt WEBHOOK_URL nếu vẫn muốn dùng forwarder cũ (backward-compat).
+GEMINI_CHAT_URL = os.getenv(
+    "GEMINI_CHAT_URL",
+    "https://gemini-web-to-api-production.up.railway.app/openai/v1/chat/completions",
+)
+# Legacy: nếu set WEBHOOK_URL thì vẫn dùng forwarder; nếu không set thì gọi thẳng.
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 KEYWORDS = [k.strip().lower() for k in os.getenv("TRIGGER_KEYWORDS", "gemini,ai,ask,hey bot").split(",")]
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "50"))
 # Cap a single stored turn so a long answer cannot blow up the JSONB row
@@ -2052,15 +2059,61 @@ bot = discord.Bot(intents=intents)
 
 async def call_webhook(history: List[Dict], channel_id: int,
                        tools: Optional[List[Dict]] = None) -> tuple[bool, dict]:
+    """Call gemini-web-to-api directly (or the legacy forwarder if WEBHOOK_URL is set).
+
+    When WEBHOOK_URL is empty we bypass the forwarder entirely:
+    - POST to GEMINI_CHAT_URL (openai/v1/chat/completions)
+    - Parse the OpenAI response ourselves (choices[0].message)
+    - Return the same dict shape the forwarder used to return so the
+      rest of the call-site is unchanged.
+    """
+    system_prompt = await build_system_prompt()
+
+    # --- direct path (no forwarder) ---
+    if not WEBHOOK_URL:
+        messages = list(history)
+        if not messages or messages[0].get("role") != "system":
+            messages = [{"role": "system", "content": system_prompt}] + messages
+
+        payload: dict = {"model": "gemini-auto", "messages": messages, "stream": False}
+        if tools and ENABLE_TOOLS:
+            payload["tools"] = tools
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(GEMINI_CHAT_URL, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                message = data["choices"][0]["message"]
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Gemini chat error: {e.response.status_code} - {e.response.text[:300]}")
+            return False, {"error": f"Gemini API error: {e.response.status_code}"}
+        except Exception as e:
+            logger.error(f"Gemini chat failed: {e}")
+            return False, {"error": str(e)}
+
+        tool_calls = message.get("tool_calls") or []
+        if tool_calls:
+            names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
+            logger.info(f"Tool calls requested (direct): {names}")
+            return True, {
+                "status": "tool_calls",
+                "tool_calls": tool_calls,
+                "content": message.get("content") or "",
+            }
+
+        answer = message.get("content") or ""
+        if not answer:
+            return False, {"error": "Gemini returned empty answer"}
+        return True, {"status": "accepted", "answer": answer, "answer_preview": answer[:100]}
+
+    # --- legacy forwarder path ---
     payload = {
         "messages": history,
-        "system": await build_system_prompt(),
+        "system": system_prompt,
         "username": BOT_USERNAME,
-        "avatar_url": BOT_AVATAR
+        "avatar_url": BOT_AVATAR,
     }
     if tools and ENABLE_TOOLS:
-        # OpenAI tool schemas; the upstream bridge turns them into a prompt and
-        # may answer with tool_calls instead of text.
         payload["tools"] = tools
     try:
         async with httpx.AsyncClient(timeout=120) as client:
@@ -2336,7 +2389,14 @@ async def on_message(message):
         if success:
             # The buffered chatter is stored now, so it stops being pending.
             pending.pop(channel_id, None)
-            await persist_turn(channel_id, messages, result.get("answer", ""))
+            answer = result.get("answer", "")
+            await persist_turn(channel_id, messages, answer)
+            # Direct path: bot sends the answer itself (no forwarder webhook).
+            # Legacy forwarder path: forwarder already posted via Discord webhook.
+            if not WEBHOOK_URL and answer:
+                # Split long answers so Discord 2000-char limit is respected.
+                for chunk in [answer[i:i+1990] for i in range(0, len(answer), 1990)]:
+                    await message.channel.send(chunk)
         else:
             # Nothing was stored: keep the buffer so the context is not lost.
             await message.reply(f"❌ Error: {result.get('error', 'Unknown error')}")
@@ -2391,8 +2451,14 @@ async def ask(ctx, question: str):
         guild=ctx.guild, channel=ctx.channel, caller=ctx.author,
     )
     if success:
-        await persist_turn(ctx.channel.id, history, result.get("answer", ""))
-        await ctx.followup.send("✅ Sent! Response will appear shortly.")
+        answer = result.get("answer", "")
+        await persist_turn(ctx.channel.id, history, answer)
+        if not WEBHOOK_URL and answer:
+            # Direct path: send answer ourselves (forwarder not used).
+            for chunk in [answer[i:i+1990] for i in range(0, len(answer), 1990)]:
+                await ctx.followup.send(chunk)
+        else:
+            await ctx.followup.send("✅ Sent! Response will appear shortly.")
     else:
         await ctx.followup.send(f"❌ Error: {result.get('error', 'Unknown error')}")
         history.pop()
