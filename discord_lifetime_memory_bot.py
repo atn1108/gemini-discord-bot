@@ -98,6 +98,10 @@ SKILLS_DIR = os.getenv("SKILLS_DIR", os.path.join(os.path.dirname(os.path.abspat
 MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(5 * 1024 * 1024)))
 MAX_FILE_TEXT_CHARS = int(os.getenv("MAX_FILE_TEXT_CHARS", "12000"))
 MUSIC_QUEUE_MAX = int(os.getenv("MUSIC_QUEUE_MAX", "50"))
+YTDLP_COOKIES = os.getenv("YTDLP_COOKIES", "").strip()
+YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+YTDLP_PO_TOKEN = os.getenv("YTDLP_PO_TOKEN", "").strip()
+GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash").strip()
 RESEARCH_TIMEOUT = int(os.getenv("RESEARCH_TIMEOUT", "300"))  # seconds, never hang
 RESEARCH_DEFAULT_SOURCES = int(os.getenv("RESEARCH_DEFAULT_SOURCES", "10"))
 # A message counts as a research request when it starts with one of these
@@ -130,7 +134,10 @@ Xưng "em" hoặc "bé", gọi các thành viên theo tên hiển thị (nếu c
 - Tối ưu độ dài: câu hỏi thường trả lời trong 1–4 câu; hướng dẫn kỹ thuật hoặc tổng hợp tin tức thì chia ý rõ ràng, đủ bước.
 
 # Tool Use (Công cụ server, nhạc, web, ảnh, tệp, skill)
-- Khi thành viên yêu cầu phát nhạc ("mở bài...", "bật nhạc...", "skip", "tạm dừng", "dừng nhạc", "xem hàng đợi"), gọi `play_music` hoặc `music_control`. Bé sẽ tự vào kênh voice của người gọi để phát.
+- Khi thành viên yêu cầu phát nhạc ("mở bài...", "bật nhạc...", "skip", "tạm dừng", "dừng nhạc", "xem hàng đợi", "chỉnh âm lượng", "rời voice"), gọi `play_music`, `music_control`, `set_volume` hoặc `leave_voice`.
+- Khi thành viên nhờ đọc/giải thích ảnh hoặc meme trên kênh, gọi `read_image`.
+- Khi thành viên nhờ tạo bình chọn hoặc hẹn giờ nhắc kèo, gọi `create_poll` hoặc `create_reminder`.
+- Khi cần tra cứu ID role/thành viên trước khi thao tác, gọi `list_roles` / `list_members`.
 - Khi cần tra cứu web mới nhất hoặc đọc nội dung một link cụ thể, gọi `web_search` / `fetch_url`.
 - Khi thành viên nhờ vẽ/tạo ảnh, gọi `generate_image` (bé tự tạo và gửi ảnh thẳng lên kênh).
 - Khi thành viên nhờ tạo/xuất file (code, markdown, json, csv, txt...), gọi `send_file` để gửi tệp đính kèm thật lên Discord.
@@ -204,6 +211,22 @@ async def init_db():
                 author TEXT NOT NULL DEFAULT '',
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS reminders (
+                id SERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                channel_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                message TEXT NOT NULL,
+                due_at TIMESTAMPTZ NOT NULL,
+                sent BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_reminders_due
+            ON reminders(sent, due_at);
         """)
     logger.info("Database initialized")
 
@@ -845,11 +868,127 @@ TOOLS: List[Dict] = [
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string", "description": "Skill name to remove/disable"}},
             "required": ["name"]}}},
+    # Role & member inspection / management.
+    {"type": "function", "function": {
+        "name": "list_roles",
+        "description": "List all roles in this server with their IDs, colors, and member counts.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "list_members",
+        "description": "List members in this server with their user IDs, display names, and online status.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Optional name/nickname filter"},
+            "limit": {"type": "integer", "description": "Max members to return (1-100, default 30)"}}}}},
+    {"type": "function", "function": {
+        "name": "create_role",
+        "description": "Create a new role in this server. Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Role name"},
+            "color": {"type": "string", "description": "Optional hex color, e.g. #ff6600"},
+            "hoist": {"type": "boolean", "description": "Display role separately in member list"},
+            "mentionable": {"type": "boolean", "description": "Allow anyone to @mention this role"},
+            "permissions": {"type": "array", "items": {"type": "string"},
+                            "description": "Optional permission names, e.g. ['manage_messages', 'kick_members']"}},
+            "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "edit_role",
+        "description": "Edit an existing role's name, color, hoist, or mentionable flag. Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "role_id": {"type": "string", "description": "Discord role ID"},
+            "name": {"type": "string", "description": "New role name"},
+            "color": {"type": "string", "description": "New hex color, e.g. #00ccff"},
+            "hoist": {"type": "boolean"},
+            "mentionable": {"type": "boolean"}},
+            "required": ["role_id"]}}},
+    {"type": "function", "function": {
+        "name": "delete_role",
+        "description": "Delete a role by ID. Admin only. Destructive.",
+        "parameters": {"type": "object", "properties": {
+            "role_id": {"type": "string", "description": "Discord role ID to delete"}},
+            "required": ["role_id"]}}},
+    # Channel & message management.
+    {"type": "function", "function": {
+        "name": "edit_channel",
+        "description": "Edit a channel's name, topic, or slowmode delay. Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "channel_id": {"type": "string", "description": "Channel ID (defaults to current channel)"},
+            "name": {"type": "string", "description": "New channel name"},
+            "topic": {"type": "string", "description": "New channel topic/description"},
+            "slowmode_delay": {"type": "integer", "description": "Slowmode in seconds (0-21600)"}}}}},
+    {"type": "function", "function": {
+        "name": "create_voice_channel",
+        "description": "Create a voice channel or category in this server. Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Voice channel or category name"},
+            "kind": {"type": "string", "enum": ["voice", "category"], "description": "Default: voice"},
+            "category_id": {"type": "string", "description": "Optional parent category ID"}},
+            "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "delete_messages",
+        "description": "Bulk-delete the last N messages in a channel (1-50). Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "limit": {"type": "integer", "description": "Number of recent messages to delete (1-50)"},
+            "channel_id": {"type": "string", "description": "Optional channel ID (defaults to current channel)"}},
+            "required": ["limit"]}}},
+    {"type": "function", "function": {
+        "name": "pin_message",
+        "description": "Pin or unpin a message by ID. Admin only.",
+        "parameters": {"type": "object", "properties": {
+            "message_id": {"type": "string", "description": "Discord message ID (or 'last' for latest message)"},
+            "channel_id": {"type": "string", "description": "Optional channel ID (defaults to current channel)"},
+            "unpin": {"type": "boolean", "description": "Set true to unpin instead of pin"}},
+            "required": ["message_id"]}}},
+    {"type": "function", "function": {
+        "name": "add_reaction",
+        "description": "React to a message with an emoji (unicode like 🔥 or custom emoji).",
+        "parameters": {"type": "object", "properties": {
+            "emoji": {"type": "string", "description": "Emoji to add, e.g. 🔥, 👍, ❤️"},
+            "message_id": {"type": "string", "description": "Message ID, or 'last' for the latest message"},
+            "channel_id": {"type": "string", "description": "Optional channel ID (defaults to current channel)"}},
+            "required": ["emoji"]}}},
+    # Voice extras.
+    {"type": "function", "function": {
+        "name": "leave_voice",
+        "description": "Disconnect the bot from its current voice channel and clear the music queue.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "set_volume",
+        "description": "Set music playback volume percentage (0-200, default 100).",
+        "parameters": {"type": "object", "properties": {
+            "volume": {"type": "integer", "description": "Volume percentage 0..200"}},
+            "required": ["volume"]}}},
+    # Utilities: Poll, Reminder, Image reading.
+    {"type": "function", "function": {
+        "name": "create_poll",
+        "description": "Create a poll in the current (or specified) channel.",
+        "parameters": {"type": "object", "properties": {
+            "question": {"type": "string", "description": "Poll question"},
+            "options": {"type": "array", "items": {"type": "string"}, "description": "2 to 10 answer options"},
+            "hours": {"type": "integer", "description": "Poll duration in hours (1-168, default 24)"},
+            "allow_multiselect": {"type": "boolean", "description": "Allow selecting multiple options"}},
+            "required": ["question", "options"]}}},
+    {"type": "function", "function": {
+        "name": "create_reminder",
+        "description": "Schedule a persistent reminder in this channel after a delay (e.g. '15m', '2h', or minutes).",
+        "parameters": {"type": "object", "properties": {
+            "message": {"type": "string", "description": "What to remind about"},
+            "delay": {"type": "string", "description": "Delay like '10m', '2h', '1d', or '30s'"},
+            "minutes": {"type": "integer", "description": "Alternative numeric delay in minutes"}},
+            "required": ["message"]}}},
+    {"type": "function", "function": {
+        "name": "read_image",
+        "description": "Read, OCR, or analyze an image/meme from a URL, message ID, or the latest image in the channel.",
+        "parameters": {"type": "object", "properties": {
+            "image_url": {"type": "string", "description": "Direct http/https image URL (optional)"},
+            "message_id": {"type": "string", "description": "Optional message ID containing the image"},
+            "question": {"type": "string", "description": "What to analyze or ask about the image"}}}}},
 ]
 
 # Tools that require admin rights.
 DANGEROUS_TOOLS = {"kick", "ban", "timeout", "create_channel", "delete_channel",
+                   "edit_channel", "create_voice_channel", "delete_messages", "pin_message",
                    "set_nickname", "add_role", "remove_role",
+                   "create_role", "edit_role", "delete_role",
                    "install_skill", "remove_skill"}
 
 load_disk_skills()
@@ -861,9 +1000,43 @@ class GuildMusicState:
         self.queue: deque = deque(maxlen=MUSIC_QUEUE_MAX)
         self.current: Optional[Dict[str, Any]] = None
         self.lock: asyncio.Lock = asyncio.Lock()
+        self.volume: float = 1.0
 
 
 music_states: Dict[int, GuildMusicState] = defaultdict(GuildMusicState)
+_YTDLP_COOKIE_TMP: Optional[str] = None
+
+
+def _get_ytdlp_cookiefile() -> Optional[str]:
+    global _YTDLP_COOKIE_TMP
+    if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+        return YTDLP_COOKIES_FILE
+    if YTDLP_COOKIES:
+        if not _YTDLP_COOKIE_TMP or not os.path.exists(_YTDLP_COOKIE_TMP):
+            import tempfile
+            fd, path = tempfile.mkstemp(prefix="ytdlp_cookies_", suffix=".txt")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(YTDLP_COOKIES)
+            _YTDLP_COOKIE_TMP = path
+        return _YTDLP_COOKIE_TMP
+    return None
+
+
+def _resolve_spotify_query(url: str) -> Optional[str]:
+    """Resolve a Spotify track/album URL to a searchable 'title' string via public oEmbed."""
+    try:
+        r = httpx.get(
+            "https://open.spotify.com/oembed",
+            params={"url": url},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            title = (r.json().get("title") or "").strip()
+            if title:
+                return title
+    except Exception:
+        pass
+    return None
 
 
 def _format_duration(seconds) -> str:
@@ -876,13 +1049,28 @@ def _format_duration(seconds) -> str:
 
 
 def _extract_track_info(query: str) -> Dict[str, Any]:
-    """Blocking yt-dlp extraction (run via asyncio.to_thread)."""
+    """Blocking yt-dlp extraction (run via asyncio.to_thread).
+
+    Supports YouTube (with optional YTDLP_COOKIES / YTDLP_PO_TOKEN),
+    SoundCloud URLs or `scsearch:` queries, and Spotify URLs (resolved via oEmbed).
+    Falls back to SoundCloud search if YouTube search fails (e.g. bot check).
+    """
     import yt_dlp
 
     q = query.strip()
+    if "open.spotify.com/" in q.lower():
+        resolved = _resolve_spotify_query(q)
+        if resolved:
+            q = resolved
+
     is_url = q.startswith(("http://", "https://"))
-    target = q if is_url else f"ytsearch1:{q}"
-    opts = {
+    has_prefix = q.lower().startswith(("ytsearch", "scsearch"))
+    if is_url or has_prefix:
+        targets = [q]
+    else:
+        targets = [f"ytsearch1:{q}", f"scsearch1:{q}"]
+
+    base_opts: Dict[str, Any] = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
@@ -890,32 +1078,49 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
         "default_search": "ytsearch",
         "source_address": "0.0.0.0",
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(target, download=False)
-    if not info:
-        raise ValueError("No matching audio found")
-    if "entries" in info:
-        entries = [e for e in (info.get("entries") or []) if e]
-        if not entries:
-            raise ValueError("No matching audio found")
-        info = entries[0]
-    stream_url = info.get("url")
-    if not stream_url:
-        raise ValueError("No playable audio stream URL returned")
+    cookiefile = _get_ytdlp_cookiefile()
+    if cookiefile:
+        base_opts["cookiefile"] = cookiefile
+    if YTDLP_PO_TOKEN:
+        base_opts["extractor_args"] = {"youtube": {"po_token": [f"web+{YTDLP_PO_TOKEN}"]}}
+
+    last_err: Optional[Exception] = None
+    info = None
+    for target in targets:
+        try:
+            with yt_dlp.YoutubeDL(base_opts) as ydl:
+                info = ydl.extract_info(target, download=False)
+            if info:
+                if "entries" in info:
+                    entries = [e for e in (info.get("entries") or []) if e]
+                    if entries:
+                        info = entries[0]
+                    else:
+                        info = None
+                if info and info.get("url"):
+                    break
+        except Exception as e:
+            last_err = e
+            info = None
+
+    if not info or not info.get("url"):
+        raise ValueError(str(last_err) if last_err else "No playable audio stream URL returned")
+
     return {
         "title": info.get("title") or q,
-        "stream_url": stream_url,
+        "stream_url": info["url"],
         "webpage_url": info.get("webpage_url") or (q if is_url else ""),
         "duration": info.get("duration") or 0,
     }
 
 
-def _create_audio_source(stream_url: str):
-    return discord.FFmpegPCMAudio(
+def _create_audio_source(stream_url: str, volume: float = 1.0):
+    raw = discord.FFmpegPCMAudio(
         stream_url,
         before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
         options="-vn",
     )
+    return discord.PCMVolumeTransformer(raw, volume=max(0.0, min(float(volume), 2.0)))
 
 
 async def _play_next_track(guild: discord.Guild) -> None:
@@ -940,6 +1145,8 @@ async def _play_next_track(guild: discord.Guild) -> None:
         state.current = nxt
         try:
             source = _create_audio_source(nxt["stream_url"])
+            if state.volume != 1.0 and hasattr(source, "volume"):
+                source.volume = state.volume
             loop = getattr(bot, "loop", None) or asyncio.get_running_loop()
 
             def _after(err):
@@ -1029,6 +1236,34 @@ async def _handle_music_control(guild: discord.Guild, action: str) -> str:
         await vc.disconnect()
         return "Stopped music, cleared queue, and left voice channel."
     return f"ERROR: unknown music action '{action}'"
+
+
+async def _handle_leave_voice(guild: discord.Guild) -> str:
+    state = music_states[guild.id]
+    state.queue.clear()
+    state.current = None
+    vc = getattr(guild, "voice_client", None)
+    if vc is None:
+        return "Bot is not currently in a voice channel."
+    if vc.is_playing() or vc.is_paused():
+        vc.stop()
+    await vc.disconnect()
+    return "Left voice channel and cleared music queue."
+
+
+async def _handle_set_volume(guild: discord.Guild, volume_pct: Any) -> str:
+    try:
+        pct = int(volume_pct)
+    except Exception:
+        return "ERROR: volume must be an integer between 0 and 200"
+    pct = max(0, min(pct, 200))
+    state = music_states[guild.id]
+    state.volume = pct / 100.0
+    vc = getattr(guild, "voice_client", None)
+    src = getattr(vc, "source", None) if vc is not None else None
+    if src is not None and hasattr(src, "volume"):
+        src.volume = state.volume
+    return f"Set music volume to {pct}%."
 
 
 # ===== WEB SEARCH & URL FETCH =====
@@ -1706,6 +1941,275 @@ async def resolve_member(guild: discord.Guild, member_id: str) -> Optional[disco
         return guild.get_member(int(member_id)) if str(member_id).isdigit() else None
 
 
+def _parse_hex_color(raw: Any) -> Optional[discord.Color]:
+    s = str(raw or "").strip().lstrip("#")
+    if not s:
+        return None
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", s):
+        raise ValueError(f"invalid hex color '{raw}' (expected #RRGGBB)")
+    return discord.Color(int(s, 16))
+
+
+def _resolve_target_channel(guild: discord.Guild, default_channel, channel_id: Any):
+    raw = str(channel_id or "").strip()
+    if not raw:
+        return default_channel
+    if raw.isdigit():
+        ch = guild.get_channel(int(raw))
+        if ch is not None:
+            return ch
+    return None
+
+
+async def _resolve_target_message(channel, message_id: Any):
+    raw = str(message_id or "").strip().lower()
+    if not raw or raw == "last":
+        async for m in channel.history(limit=1):
+            return m
+        return None
+    if raw.isdigit():
+        return await channel.fetch_message(int(raw))
+    return None
+
+
+def _parse_delay_seconds(delay: str = "", minutes: Any = None) -> int:
+    if minutes is not None and str(minutes).strip() != "":
+        m = int(minutes)
+        return max(10, min(m * 60, 30 * 86400))
+    s = (delay or "").strip().lower()
+    if not s:
+        return 0
+    total = 0
+    for val, unit in re.findall(r"(\d+)\s*(s|sec|m|min|phút|phut|h|hr|giờ|gio|d|day|ngày|ngay)", s):
+        n = int(val)
+        if unit in ("s", "sec"):
+            total += n
+        elif unit in ("m", "min", "phút", "phut"):
+            total += n * 60
+        elif unit in ("h", "hr", "giờ", "gio"):
+            total += n * 3600
+        elif unit in ("d", "day", "ngày", "ngay"):
+            total += n * 86400
+    if total == 0 and s.isdigit():
+        total = int(s) * 60
+    return max(0, min(total, 30 * 86400))
+
+
+async def _handle_create_poll(channel, args: Dict) -> str:
+    question = (args.get("question") or "").strip()[:300]
+    options = [str(o).strip()[:55] for o in (args.get("options") or []) if str(o).strip()][:10]
+    if not question or len(options) < 2:
+        return "ERROR: poll requires a question and at least 2 options"
+    hours = max(1, min(int(args.get("hours") or 24), 168))
+    allow_multi = bool(args.get("allow_multiselect", False))
+
+    if hasattr(discord, "Poll") and hasattr(discord, "PollAnswer"):
+        try:
+            poll = discord.Poll(
+                question=question,
+                duration=datetime.timedelta(hours=hours),
+                allow_multiselect=allow_multi,
+            )
+            for opt in options:
+                poll.add_answer(text=opt)
+            await channel.send(poll=poll)
+            return f"Created poll '{question}' with {len(options)} options ({hours}h)."
+        except Exception as e:
+            logger.warning(f"native poll failed, falling back to reaction poll: {e}")
+
+    num_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    lines = [f"📊 **{question}**"]
+    for idx, opt in enumerate(options):
+        lines.append(f"{num_emojis[idx]} {opt}")
+    msg = await channel.send("\n".join(lines))
+    for idx in range(len(options)):
+        try:
+            await msg.add_reaction(num_emojis[idx])
+        except Exception:
+            break
+    return f"Created reaction poll '{question}' with {len(options)} options."
+
+
+async def _handle_create_reminder(guild: discord.Guild, channel, caller: Optional[discord.Member], args: Dict) -> str:
+    msg = (args.get("message") or "").strip()[:500]
+    if not msg:
+        return "ERROR: reminder message is required"
+    secs = _parse_delay_seconds(args.get("delay") or "", args.get("minutes"))
+    if secs < 10:
+        return "ERROR: invalid or too-short delay (e.g. '10m', '2h', or minutes >= 1)"
+    if pool is None:
+        return "ERROR: database is not initialized"
+
+    due_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=secs)
+    uid = getattr(caller, "id", 0) or 0
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO reminders (guild_id, channel_id, user_id, message, due_at)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
+            """,
+            guild.id, channel.id, uid, msg, due_at,
+        )
+    ts = int(due_at.timestamp())
+    return f"Reminder #{row['id']} set for <t:{ts}:R> (<t:{ts}:t>): {msg}"
+
+
+async def _reminder_loop() -> None:
+    """Poll Neon Postgres every 15s for due reminders and post them to Discord."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            if pool is not None:
+                async with pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        """
+                        SELECT id, channel_id, user_id, message
+                        FROM reminders
+                        WHERE NOT sent AND due_at <= NOW()
+                        ORDER BY due_at ASC
+                        LIMIT 20
+                        """
+                    )
+                    for r in rows:
+                        ch = bot.get_channel(r["channel_id"])
+                        if ch is None:
+                            try:
+                                ch = await bot.fetch_channel(r["channel_id"])
+                            except Exception:
+                                ch = None
+                        if ch is not None and hasattr(ch, "send"):
+                            mention = f"<@{r['user_id']}> " if r["user_id"] else ""
+                            try:
+                                await ch.send(f"⏰ **Nhắc kèo:** {mention}{r['message']}")
+                            except Exception as e:
+                                logger.warning(f"reminder {r['id']} send failed: {e}")
+                        await conn.execute("UPDATE reminders SET sent = TRUE WHERE id = $1", r["id"])
+        except Exception as e:
+            logger.warning(f"reminder loop error: {e}")
+        await asyncio.sleep(15)
+
+
+async def _find_image_bytes(channel, image_url: str = "", message_id: str = "") -> tuple[Optional[bytes], str, str]:
+    """Locate an image from URL, specific message, or recent channel history."""
+    url = (image_url or "").strip()
+    if not url and channel is not None:
+        target_msg = None
+        if message_id:
+            target_msg = await _resolve_target_message(channel, message_id)
+        if target_msg is not None:
+            for att in getattr(target_msg, "attachments", []) or []:
+                ct = (getattr(att, "content_type", None) or "").lower()
+                fn = (getattr(att, "filename", None) or "").lower()
+                if ct.startswith("image/") or fn.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                    url = att.url
+                    break
+        else:
+            async for m in channel.history(limit=10):
+                for att in getattr(m, "attachments", []) or []:
+                    ct = (getattr(att, "content_type", None) or "").lower()
+                    fn = (getattr(att, "filename", None) or "").lower()
+                    if ct.startswith("image/") or fn.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                        url = att.url
+                        break
+                if url:
+                    break
+                for emb in getattr(m, "embeds", []) or []:
+                    img = getattr(emb, "image", None)
+                    if img and getattr(img, "url", None):
+                        url = img.url
+                        break
+                if url:
+                    break
+
+    if not url:
+        return None, "", "No image found in URL or recent channel messages."
+    ok, reason = _is_safe_public_url(url)
+    if not ok:
+        return None, "", f"Unsafe image URL ({reason})."
+
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200 or not r.content:
+                return None, "", f"Failed to download image (HTTP {r.status_code})."
+            if len(r.content) > MAX_ATTACHMENT_BYTES:
+                return None, "", "Image exceeds 5MB limit."
+            mime = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
+            if not mime.startswith("image/"):
+                mime = "image/png"
+            return r.content, mime, ""
+    except Exception as e:
+        return None, "", str(e)
+
+
+async def _handle_read_image(channel, args: Dict) -> str:
+    raw, mime, err = await _find_image_bytes(
+        channel,
+        args.get("image_url") or "",
+        args.get("message_id") or "",
+    )
+    if not raw:
+        return f"ERROR: {err}"
+
+    question = (args.get("question") or "").strip() or (
+        "Mô tả chi tiết nội dung, chữ viết (OCR) và ý nghĩa/meme của ảnh này bằng tiếng Việt."
+    )
+    b64 = base64.b64encode(raw).decode("ascii")
+
+    # 1. Official Gemini API vision when GEMINI_API_KEY is available.
+    if GEMINI_API_KEY:
+        try:
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_VISION_MODEL}:generateContent"
+            async with httpx.AsyncClient(timeout=45) as client:
+                r = await client.post(
+                    endpoint,
+                    headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                    json={
+                        "contents": [{
+                            "parts": [
+                                {"text": question},
+                                {"inline_data": {"mime_type": mime, "data": b64}},
+                            ]
+                        }]
+                    },
+                )
+            if r.status_code == 200:
+                cands = r.json().get("candidates") or []
+                parts = ((cands[0].get("content") or {}).get("parts") or []) if cands else []
+                texts = [p.get("text", "") for p in parts if p.get("text")]
+                if texts:
+                    return "\n".join(texts)[:3000]
+        except Exception as e:
+            logger.warning(f"Gemini vision failed: {e}")
+
+    # 2. Fallback via GEMINI_CHAT_URL (OpenAI multimodal format).
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                GEMINI_CHAT_URL,
+                json={
+                    "model": "gemini-auto",
+                    "stream": False,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": question},
+                            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                        ],
+                    }],
+                },
+            )
+        if r.status_code == 200:
+            ans = (r.json()["choices"][0]["message"].get("content") or "").strip()
+            if ans:
+                return ans[:3000]
+    except Exception as e:
+        logger.warning(f"GEMINI_CHAT_URL vision failed: {e}")
+
+    return "ERROR: could not analyze image with vision backend."
+
+
 async def execute_tool(name: str, args: Dict, guild: discord.Guild,
                        channel: discord.abc.GuildChannel,
                        caller: Optional[discord.Member],
@@ -1878,6 +2382,177 @@ async def execute_tool(name: str, args: Dict, guild: discord.Guild,
             if await set_skill_enabled(target_name, False):
                 return f"Disabled built-in skill '{target_name}'."
             return f"ERROR: skill '{args.get('name')}' not found"
+
+        if name == "list_roles":
+            roles = sorted(getattr(guild, "roles", []) or [], key=lambda r: getattr(r, "position", 0), reverse=True)
+            if not roles:
+                return "No roles found."
+            lines = []
+            for r in roles[:50]:
+                col = str(getattr(r, "color", "")) or "#000000"
+                cnt = len(getattr(r, "members", []) or [])
+                lines.append(f"- {r.name} ({r.id}) | {col} | {cnt} members")
+            return "\n".join(lines)
+
+        if name == "list_members":
+            q = (args.get("query") or "").strip().lower()
+            limit = max(1, min(int(args.get("limit") or 30), 100))
+            members = list(getattr(guild, "members", []) or [])
+            if not members and hasattr(bot, "http"):
+                try:
+                    raw_members = await bot.http.get_members(guild.id, limit=min(limit * 2, 1000), after=None)
+                    out = []
+                    for m in raw_members or []:
+                        u = m.get("user") or {}
+                        disp = m.get("nick") or u.get("global_name") or u.get("username") or "?"
+                        if q and q not in disp.lower() and q not in (u.get("username") or "").lower():
+                            continue
+                        tag = " [BOT]" if u.get("bot") else ""
+                        out.append(f"- {disp} ({u.get('id')}){tag}")
+                        if len(out) >= limit:
+                            break
+                    return "\n".join(out) or "No matching members found."
+                except Exception:
+                    pass
+            out = []
+            for m in members:
+                disp = getattr(m, "display_name", getattr(m, "name", "?"))
+                if q and q not in disp.lower() and q not in (getattr(m, "name", "") or "").lower():
+                    continue
+                st = str(getattr(m, "status", "unknown"))
+                tag = " [BOT]" if getattr(m, "bot", False) else ""
+                out.append(f"- {disp} ({m.id}) [{st}]{tag}")
+                if len(out) >= limit:
+                    break
+            return "\n".join(out) or "No matching members found."
+
+        if name == "create_role":
+            rname = (args.get("name") or "").strip()[:100]
+            if not rname:
+                return "ERROR: role name is required"
+            kwargs: Dict[str, Any] = {"name": rname, "reason": f"by {BOT_USERNAME}"}
+            col = _parse_hex_color(args.get("color"))
+            if col is not None:
+                kwargs["color"] = col
+            if "hoist" in args:
+                kwargs["hoist"] = bool(args["hoist"])
+            if "mentionable" in args:
+                kwargs["mentionable"] = bool(args["mentionable"])
+            perm_names = args.get("permissions") or []
+            if perm_names:
+                perms = discord.Permissions.none()
+                for pn in perm_names:
+                    key = str(pn).strip().lower()
+                    if hasattr(perms, key):
+                        setattr(perms, key, True)
+                kwargs["permissions"] = perms
+            role = await guild.create_role(**kwargs)
+            return f"Created role {role.name} ({role.id})"
+
+        if name == "edit_role":
+            role = guild.get_role(int(args.get("role_id") or 0))
+            if role is None:
+                return f"ERROR: role {args.get('role_id')} not found"
+            kwargs = {"reason": f"by {BOT_USERNAME}"}
+            if args.get("name"):
+                kwargs["name"] = str(args["name"]).strip()[:100]
+            col = _parse_hex_color(args.get("color"))
+            if col is not None:
+                kwargs["color"] = col
+            if "hoist" in args:
+                kwargs["hoist"] = bool(args["hoist"])
+            if "mentionable" in args:
+                kwargs["mentionable"] = bool(args["mentionable"])
+            await role.edit(**kwargs)
+            return f"Updated role {role.name} ({role.id})"
+
+        if name == "delete_role":
+            role = guild.get_role(int(args.get("role_id") or 0))
+            if role is None:
+                return f"ERROR: role {args.get('role_id')} not found"
+            if getattr(role, "is_default", lambda: False)():
+                return "ERROR: cannot delete @everyone role"
+            rname, rid = role.name, role.id
+            await role.delete(reason=f"by {BOT_USERNAME}")
+            return f"Deleted role {rname} ({rid})"
+
+        if name == "edit_channel":
+            target = _resolve_target_channel(guild, channel, args.get("channel_id"))
+            if target is None:
+                return "ERROR: channel not found"
+            kwargs = {"reason": f"by {BOT_USERNAME}"}
+            if args.get("name"):
+                kwargs["name"] = str(args["name"]).strip()[:100]
+            if "topic" in args and args["topic"] is not None:
+                kwargs["topic"] = str(args["topic"])[:1024]
+            if "slowmode_delay" in args and args["slowmode_delay"] is not None:
+                kwargs["slowmode_delay"] = max(0, min(int(args["slowmode_delay"]), 21600))
+            await target.edit(**kwargs)
+            return f"Updated channel <#{target.id}> ({target.id})"
+
+        if name == "create_voice_channel":
+            cname = (args.get("name") or "").strip()[:100]
+            if not cname:
+                return "ERROR: name is required"
+            kind = (args.get("kind") or "voice").strip().lower()
+            if kind == "category":
+                cat = await guild.create_category(cname, reason=f"by {BOT_USERNAME}")
+                return f"Created category {cat.name} ({cat.id})"
+            cat = None
+            cid = str(args.get("category_id") or "").strip()
+            if cid.isdigit():
+                cat = guild.get_channel(int(cid))
+            vc_ch = await guild.create_voice_channel(cname, category=cat, reason=f"by {BOT_USERNAME}")
+            return f"Created voice channel <#{vc_ch.id}> ({vc_ch.id})"
+
+        if name == "delete_messages":
+            target = _resolve_target_channel(guild, channel, args.get("channel_id"))
+            if target is None or not hasattr(target, "purge"):
+                return "ERROR: channel not found or cannot purge messages"
+            limit = max(1, min(int(args.get("limit") or 1), 50))
+            deleted = await target.purge(limit=limit)
+            return f"Deleted {len(deleted)} message(s) in <#{target.id}>."
+
+        if name == "pin_message":
+            target = _resolve_target_channel(guild, channel, args.get("channel_id"))
+            if target is None:
+                return "ERROR: channel not found"
+            msg = await _resolve_target_message(target, args.get("message_id"))
+            if msg is None:
+                return "ERROR: message not found"
+            if args.get("unpin"):
+                await msg.unpin(reason=f"by {BOT_USERNAME}")
+                return f"Unpinned message {msg.id}."
+            await msg.pin(reason=f"by {BOT_USERNAME}")
+            return f"Pinned message {msg.id}."
+
+        if name == "add_reaction":
+            emoji = (args.get("emoji") or "").strip()
+            if not emoji:
+                return "ERROR: emoji is required"
+            target = _resolve_target_channel(guild, channel, args.get("channel_id"))
+            if target is None:
+                return "ERROR: channel not found"
+            msg = await _resolve_target_message(target, args.get("message_id") or "last")
+            if msg is None:
+                return "ERROR: message not found"
+            await msg.add_reaction(emoji)
+            return f"Reacted {emoji} on message {msg.id}."
+
+        if name == "leave_voice":
+            return await _handle_leave_voice(guild)
+
+        if name == "set_volume":
+            return await _handle_set_volume(guild, args.get("volume"))
+
+        if name == "create_poll":
+            return await _handle_create_poll(channel, args)
+
+        if name == "create_reminder":
+            return await _handle_create_reminder(guild, channel, caller, args)
+
+        if name == "read_image":
+            return await _handle_read_image(channel, args)
 
         if name in SKILL_HANDLERS:
             handler = SKILL_HANDLERS[name]
@@ -2199,6 +2874,9 @@ async def on_ready():
     # Seed the peer-bot roster from the member list so bots that have not said
     # anything yet are already known. REST, no privileged intent required.
     asyncio.create_task(_seed_peer_bots())
+    if not getattr(bot, "_reminder_task_started", False):
+        bot._reminder_task_started = True
+        asyncio.create_task(_reminder_loop())
 
 
 async def _seed_peer_bots() -> None:
