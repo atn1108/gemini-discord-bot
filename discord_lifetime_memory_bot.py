@@ -1140,9 +1140,12 @@ def _extract_track_info(query: str) -> Dict[str, Any]:
 
 
 def _create_audio_source(stream_url: str, volume: float = 1.0):
+    is_hls = ".m3u8" in (stream_url or "").lower()
+    is_http = (stream_url or "").startswith(("http://", "https://"))
+    before = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5" if (is_http and not is_hls) else None
     raw = discord.FFmpegPCMAudio(
         stream_url,
-        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        before_options=before,
         options="-vn",
     )
     return discord.PCMVolumeTransformer(raw, volume=max(0.0, min(float(volume), 2.0)))
@@ -1210,6 +1213,13 @@ async def _ensure_voice(guild: discord.Guild, caller: Optional[discord.Member]):
 
     if vc is None or not getattr(vc, "is_connected", lambda: True)():
         return None, "ERROR: Could not establish voice connection."
+    me_voice = getattr(getattr(guild, "me", None), "voice", None)
+    logger.info(
+        f"Voice ready in #{getattr(vc.channel, 'name', '?')} "
+        f"(opus={discord.opus.is_loaded()}, mute={getattr(me_voice, 'mute', None)}, "
+        f"self_mute={getattr(me_voice, 'self_mute', None)}, "
+        f"dave={getattr(vc, 'dave_protocol_version', None)})"
+    )
     return vc, ""
 
 
@@ -1236,8 +1246,10 @@ async def _handle_play_music(guild: discord.Guild, caller: Optional[discord.Memb
 
     state.queue.appendleft(track)
     await _play_next_track(guild)
+    me_voice = getattr(getattr(guild, "me", None), "voice", None)
+    mute_note = " (Lưu ý: bot đang bị Server Mute trong kênh thoại, hãy unmute bot!)" if getattr(me_voice, "mute", False) else ""
     return (f"Now playing in #{voice_ch.name}: {track['title']} "
-            f"({_format_duration(track['duration'])})")
+            f"({_format_duration(track['duration'])}){mute_note}")
 
 
 async def _handle_music_control(guild: discord.Guild, action: str) -> str:
